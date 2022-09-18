@@ -1,4 +1,0 @@
-include LICENSE
-include metaflow/plugins/cards/card_modules/*.html
-include metaflow/plugins/cards/card_modules/*.js
-include metaflow/plugins/cards/card_modules/*.css
