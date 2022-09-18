@@ -1,2 +1,0 @@
-# install graphviz first
-dot -Tpng lifecycle.dot -o lifecycle.png
