@@ -39,7 +39,7 @@ access results
 # More questions?
 
 If you have any questions, feel free to post a bug report/question on the
-Metaflow Github page.
+Metaflow GitHub page.
 """
 
 import importlib
@@ -93,20 +93,29 @@ for m in _override_modules:
         tl_package = m.split(".")[1]
         lazy_load_aliases(alias_submodules(extension_module, tl_package, None))
 
-from .event_logger import EventLogger
-
-# Flow spec
-from .flowspec import FlowSpec
-from .includefile import IncludeFile
-from .parameters import Parameter, JSONTypeClass
-
-JSONType = JSONTypeClass()
+# Utilities
+from .multicore_utils import parallel_imap_unordered, parallel_map
+from .metaflow_profile import profile
 
 # current runtime singleton
 from .current import current
 
+# Flow spec
+from .flowspec import FlowSpec
+
+from .parameters import Parameter, JSONTypeClass
+
+JSONType = JSONTypeClass()
+
 # data layer
-from .datatools import S3
+# For historical reasons, we make metaflow.plugins.datatools accessible as
+# metaflow.datatools. S3 is also a tool that has historically been available at the
+# TL so keep as is.
+lazy_load_aliases({"metaflow.datatools": "metaflow.plugins.datatools"})
+from .plugins.datatools import S3
+
+# includefile
+from .includefile import IncludeFile
 
 # Decorators
 from .decorators import step, _import_plugin_decorators
@@ -133,10 +142,6 @@ from .client import (
     Task,
     DataArtifact,
 )
-
-# Utilities
-from .multicore_utils import parallel_imap_unordered, parallel_map
-from .metaflow_profile import profile
 
 __version_addl__ = []
 _ext_debug("Loading top-level modules")

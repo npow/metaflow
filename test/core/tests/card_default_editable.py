@@ -34,7 +34,7 @@ class MyNativeType:
     @tag('card(type="test_editable_card", id="xyz")')
     @steps(0, ["foreach-nested-inner"])
     def step_foreach_inner(self):
-        # In this step `test_editable_card` should considered default editable even with `id`
+        # In this step `test_editable_card` should be considered default editable even with `id`
         from metaflow import current
         from metaflow.plugins.cards.card_modules.test_cards import TestStringComponent
         import random
@@ -91,7 +91,7 @@ class MyNativeType:
                         step.name,
                         task_id,
                         card_type,
-                        "%d\n" % number,
+                        "%d" % number,
                         card_hash=card["hash"],
                         exact_match=True,
                     )

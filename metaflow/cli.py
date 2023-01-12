@@ -1,5 +1,4 @@
 import inspect
-import os
 import sys
 import traceback
 from datetime import datetime
@@ -15,6 +14,7 @@ from . import metaflow_version
 from . import namespace
 from . import current
 from .cli_args import cli_args
+from .tagging_util import validate_tags
 from .util import (
     resolve_identity,
     decompress_list,
@@ -24,11 +24,12 @@ from .util import (
 from .task import MetaflowTask
 from .exception import CommandException, MetaflowException
 from .graph import FlowGraph
-from .datastore import DATASTORES, FlowDataStore, TaskDataStoreSet, TaskDataStore
+from .datastore import FlowDataStore, TaskDataStoreSet, TaskDataStore
 
 from .runtime import NativeRuntime
 from .package import MetaflowPackage
 from .plugins import (
+    DATASTORES,
     ENVIRONMENTS,
     LOGGING_SIDECARS,
     METADATA_PROVIDERS,
@@ -44,8 +45,6 @@ from .metaflow_config import (
 )
 from .metaflow_environment import MetaflowEnvironment
 from .pylint_wrapper import PyLint
-from .event_logger import EventLogger
-from .monitor import Monitor
 from .R import use_r, metaflow_r_version
 from .mflog import mflog, LOG_SOURCES
 from .unbounded_foreach import UBF_CONTROL, UBF_TASK
@@ -111,7 +110,7 @@ def echo_always(line, **kwargs):
         click.secho(ERASE_TO_EOL, **kwargs)
 
 
-def logger(body="", system_msg=False, head="", bad=False, timestamp=True):
+def logger(body="", system_msg=False, head="", bad=False, timestamp=True, nl=True):
     if timestamp:
         if timestamp is True:
             dt = datetime.now()
@@ -121,7 +120,7 @@ def logger(body="", system_msg=False, head="", bad=False, timestamp=True):
         click.secho(tstamp + " ", fg=LOGGER_TIMESTAMP, nl=False)
     if head:
         click.secho(head, fg=LOGGER_COLOR, nl=False)
-    click.secho(body, bold=system_msg, fg=LOGGER_BAD_COLOR if bad else None)
+    click.secho(body, bold=system_msg, fg=LOGGER_BAD_COLOR if bad else None, nl=nl)
 
 
 @click.group()
@@ -174,10 +173,22 @@ def help(ctx):
 
 
 @cli.command(help="Output internal state of the flow graph.")
+@click.option("--json", is_flag=True, help="Output the flow graph in JSON format.")
 @click.pass_obj
-def output_raw(obj):
-    echo("Internal representation of the flow:", fg="magenta", bold=False)
-    echo_always(str(obj.graph), err=False)
+def output_raw(obj, json):
+    if json:
+        import json as _json
+
+        _msg = "Internal representation of the flow in JSON format:"
+        _graph_dict, _graph_struct = obj.graph.output_steps()
+        _graph = _json.dumps(
+            dict(graph=_graph_dict, graph_structure=_graph_struct), indent=4
+        )
+    else:
+        _graph = str(obj.graph)
+        _msg = "Internal representation of the flow:"
+    echo(_msg, fg="magenta", bold=False)
+    echo_always(_graph, err=False)
 
 
 @cli.command(help="Visualize the flow with Graphviz.")
@@ -240,7 +251,7 @@ def dump(obj, input_path, private=None, max_value_size=None, include=None, file=
         run_id, step_name, task_id = parts
     else:
         raise CommandException(
-            "input_path should either be run_id/step_name" "or run_id/step_name/task_id"
+            "input_path should either be run_id/step_name or run_id/step_name/task_id"
         )
 
     datastore_set = TaskDataStoreSet(
@@ -386,7 +397,7 @@ def logs(obj, input_path, stdout=None, stderr=None, both=None, timestamps=False)
                     log = ds.load_log_legacy(stream)
                     if log and timestamps:
                         raise CommandException(
-                            "We can't show --timestamps for " "old runs. Sorry!"
+                            "We can't show --timestamps for old runs. Sorry!"
                         )
                     echo_unicode(log, nl=False)
     else:
@@ -416,7 +427,13 @@ def logs(obj, input_path, stdout=None, stderr=None, both=None, timestamps=False)
 )
 @click.option(
     "--input-paths",
-    help="A comma-separated list of pathspecs " "specifying inputs for this step.",
+    help="A comma-separated list of pathspecs specifying inputs for this step.",
+)
+@click.option(
+    "--input-paths-filename",
+    type=click.Path(exists=True, readable=True, dir_okay=False, resolve_path=True),
+    help="A filename containing the argument typically passed to `input-paths`",
+    hidden=True,
 )
 @click.option(
     "--split-index",
@@ -438,7 +455,7 @@ def logs(obj, input_path, stdout=None, stderr=None, both=None, timestamps=False)
     "--namespace",
     "opt_namespace",
     default=None,
-    help="Change namespace from the default (your username) to " "the specified tag.",
+    help="Change namespace from the default (your username) to the specified tag.",
 )
 @click.option(
     "--retry-count",
@@ -457,9 +474,16 @@ def logs(obj, input_path, stdout=None, stderr=None, both=None, timestamps=False)
     "not execute anything.",
 )
 @click.option(
+    "--clone-wait-only/--no-clone-wait-only",
+    default=False,
+    show_default=True,
+    help="If specified, waits for an external process to clone the task",
+    hidden=True,
+)
+@click.option(
     "--clone-run-id",
     default=None,
-    help="Run id of the origin flow, if this task is part of a flow " "being resumed.",
+    help="Run id of the origin flow, if this task is part of a flow being resumed.",
 )
 @click.option(
     "--with",
@@ -473,7 +497,7 @@ def logs(obj, input_path, stdout=None, stderr=None, both=None, timestamps=False)
     "--ubf-context",
     default="none",
     type=click.Choice(["none", UBF_CONTROL, UBF_TASK]),
-    help="Provides additional context if this task is of type " "unbounded foreach.",
+    help="Provides additional context if this task is of type unbounded foreach.",
 )
 @click.option(
     "--num-parallel",
@@ -489,11 +513,13 @@ def step(
     run_id=None,
     task_id=None,
     input_paths=None,
+    input_paths_filename=None,
     split_index=None,
     opt_namespace=None,
     retry_count=None,
     max_user_code_retries=None,
     clone_only=None,
+    clone_wait_only=False,
     clone_run_id=None,
     decospecs=None,
     ubf_context="none",
@@ -526,6 +552,10 @@ def step(
     cli_args._set_step_kwargs(step_kwargs)
 
     ctx.obj.metadata.add_sticky_tags(tags=opt_tag)
+    if not input_paths and input_paths_filename:
+        with open(input_paths_filename, mode="r", encoding="utf-8") as f:
+            input_paths = f.read().strip(" \n\"'")
+
     paths = decompress_list(input_paths) if input_paths else []
 
     task = MetaflowTask(
@@ -539,7 +569,14 @@ def step(
         ubf_context,
     )
     if clone_only:
-        task.clone_only(step_name, run_id, task_id, clone_only, retry_count)
+        task.clone_only(
+            step_name,
+            run_id,
+            task_id,
+            clone_only,
+            retry_count,
+            wait_only=clone_wait_only,
+        )
     else:
         task.run_step(
             step_name,
@@ -662,6 +699,26 @@ def common_run_options(func):
     help="ID of the run that should be resumed. By default, the "
     "last run executed locally.",
 )
+@click.option(
+    "--run-id",
+    default=None,
+    help="Run ID for the new run. By default, a new run-id will be generated",
+    hidden=True,
+)
+@click.option(
+    "--clone-only/--no-clone-only",
+    default=False,
+    show_default=True,
+    help="Only clone tasks without continuing execution",
+    hidden=True,
+)
+@click.option(
+    "--reentrant/--no-reentrant",
+    default=False,
+    show_default=True,
+    hidden=True,
+    help="If specified, allows this call to be called in parallel",
+)
 @click.argument("step-to-rerun", required=False)
 @cli.command(help="Resume execution of a previous run of this flow.")
 @common_run_options
@@ -671,6 +728,9 @@ def resume(
     tags=None,
     step_to_rerun=None,
     origin_run_id=None,
+    run_id=None,
+    clone_only=False,
+    reentrant=False,
     max_workers=None,
     max_num_splits=None,
     max_log_size=None,
@@ -700,6 +760,17 @@ def resume(
             )
         clone_steps = {step_to_rerun}
 
+    if run_id:
+        # Run-ids that are provided by the metadata service are always integers.
+        # External providers or run-ids (like external schedulers) always need to
+        # be non-integers to avoid any clashes. This condition ensures this.
+        try:
+            int(run_id)
+        except:
+            pass
+        else:
+            raise CommandException("run-id %s cannot be an integer" % run_id)
+
     runtime = NativeRuntime(
         obj.flow,
         obj.graph,
@@ -711,16 +782,18 @@ def resume(
         obj.entrypoint,
         obj.event_logger,
         obj.monitor,
+        run_id=run_id,
         clone_run_id=origin_run_id,
+        clone_only=clone_only,
+        reentrant=reentrant,
         clone_steps=clone_steps,
         max_workers=max_workers,
         max_num_splits=max_num_splits,
         max_log_size=max_log_size * 1024 * 1024,
     )
+    write_run_id(run_id_file, runtime.run_id)
     runtime.persist_constants()
     runtime.execute()
-
-    write_run_id(run_id_file, runtime.run_id)
 
 
 @parameters.add_custom_parameters(deploy_mode=True)
@@ -784,6 +857,8 @@ def write_run_id(run_id_file, run_id):
 
 
 def before_run(obj, tags, decospecs):
+    validate_tags(tags)
+
     # There's a --with option both at the top-level and for the run
     # subcommand. Why?
     #
@@ -791,8 +866,8 @@ def before_run(obj, tags, decospecs):
     # This is a very common use case of --with.
     #
     # A downside is that we need to have the following decorators handling
-    # in two places in this module and we need to make sure that
-    # _init_step_decorators doesn't get called twice.
+    # in two places in this module and make sure _init_step_decorators
+    # doesn't get called twice.
     if decospecs:
         decorators._attach_decorators(obj.flow, decospecs)
         obj.graph = FlowGraph(obj.flow.__class__)
@@ -802,6 +877,7 @@ def before_run(obj, tags, decospecs):
     decorators._init_step_decorators(
         obj.flow, obj.graph, obj.environment, obj.flow_datastore, obj.logger
     )
+
     obj.metadata.add_sticky_tags(tags=tags)
 
     # Package working directory only once per run.
@@ -848,13 +924,13 @@ def version(obj):
     "--datastore",
     default=DEFAULT_DATASTORE,
     show_default=True,
-    type=click.Choice(DATASTORES),
+    type=click.Choice([d.TYPE for d in DATASTORES]),
     help="Data backend type",
 )
 @click.option("--datastore-root", help="Root path for datastore")
 @click.option(
     "--package-suffixes",
-    help="A comma-separated list of file suffixes to include " "in the code package.",
+    help="A comma-separated list of file suffixes to include in the code package.",
     default=DEFAULT_PACKAGE_SUFFIXES,
     show_default=True,
 )
@@ -918,6 +994,7 @@ def start(
     cli_args._set_top_kwargs(ctx.params)
     ctx.obj.echo = echo
     ctx.obj.echo_always = echo_always
+    ctx.obj.is_quiet = quiet
     ctx.obj.graph = FlowGraph(ctx.obj.flow.__class__)
     ctx.obj.logger = logger
     ctx.obj.check = _check
@@ -926,21 +1003,26 @@ def start(
     ctx.obj.package_suffixes = package_suffixes.split(",")
     ctx.obj.reconstruct_cli = _reconstruct_cli
 
-    ctx.obj.event_logger = EventLogger(event_logger)
-
     ctx.obj.environment = [
         e for e in ENVIRONMENTS + [MetaflowEnvironment] if e.TYPE == environment
     ][0](ctx.obj.flow)
-    ctx.obj.environment.validate_environment(echo)
+    ctx.obj.environment.validate_environment(echo, datastore)
 
-    ctx.obj.monitor = Monitor(monitor, ctx.obj.environment, ctx.obj.flow.name)
+    ctx.obj.event_logger = LOGGING_SIDECARS[event_logger](
+        flow=ctx.obj.flow, env=ctx.obj.environment
+    )
+    ctx.obj.event_logger.start()
+
+    ctx.obj.monitor = MONITOR_SIDECARS[monitor](
+        flow=ctx.obj.flow, env=ctx.obj.environment
+    )
     ctx.obj.monitor.start()
 
     ctx.obj.metadata = [m for m in METADATA_PROVIDERS if m.TYPE == metadata][0](
         ctx.obj.environment, ctx.obj.flow, ctx.obj.event_logger, ctx.obj.monitor
     )
 
-    ctx.obj.datastore_impl = DATASTORES[datastore]
+    ctx.obj.datastore_impl = [d for d in DATASTORES if d.TYPE == datastore][0]
 
     if datastore_root is None:
         datastore_root = ctx.obj.datastore_impl.get_datastore_root_from_config(
@@ -964,7 +1046,7 @@ def start(
     )
 
     # It is important to initialize flow decorators early as some of the
-    # things they provide may be used by some of the objects initialize after.
+    # things they provide may be used by some of the objects initialized after.
     decorators._init_flow_decorators(
         ctx.obj.flow,
         ctx.obj.graph,
@@ -1105,3 +1187,8 @@ def main(flow, args=None, handle_exceptions=True, entrypoint=None):
             sys.exit(1)
         else:
             raise
+    finally:
+        if hasattr(state, "monitor") and state.monitor is not None:
+            state.monitor.terminate()
+        if hasattr(state, "event_logger") and state.event_logger is not None:
+            state.event_logger.terminate()

@@ -1,12 +1,17 @@
 from __future__ import print_function
+from io import BytesIO
+import math
 import sys
 import os
 import time
 
 from types import MethodType, FunctionType
 
+from metaflow.datastore.exceptions import DataException
+
 from .metaflow_config import MAX_ATTEMPTS
 from .metadata import MetaDatum
+from .mflog import TASK_LOG_SOURCE
 from .datastore import Inputs, TaskDataStoreSet
 from .exception import (
     MetaflowInternalError,
@@ -48,7 +53,9 @@ class MetaflowTask(object):
         self.ubf_context = ubf_context
 
     def _exec_step_function(self, step_function, input_obj=None):
-        self.environment.validate_environment(echo=self.console_logger)
+        self.environment.validate_environment(
+            self.console_logger, self.flow_datastore.TYPE
+        )
         if input_obj is None:
             step_function()
         else:
@@ -94,7 +101,7 @@ class MetaflowTask(object):
 
         param_only_vars = list(all_vars)
         # make class-level values read-only to be more consistent across steps in a flow
-        # they are also only persisted once and so we similarly pass them down if
+        # they are also only persisted once, so we similarly pass them down if
         # required
         for var in dir(cls):
             if var[0] == "_" or var in cls._NON_PARAMETERS or var in all_vars:
@@ -157,7 +164,7 @@ class MetaflowTask(object):
         if not ds_list:
             # this guards against errors in input paths
             raise MetaflowDataMissing(
-                "Input paths *%s* resolved to zero " "inputs" % ",".join(input_paths)
+                "Input paths *%s* resolved to zero inputs" % ",".join(input_paths)
             )
         return ds_list
 
@@ -198,7 +205,7 @@ class MetaflowTask(object):
                 )
 
             # assert that none of the inputs are splits - we don't
-            # allow empty foreaches (joins immediately following splits)
+            # allow empty `foreach`s (joins immediately following splits)
             if any(not i.is_none("_foreach_var") for i in inputs):
                 raise MetaflowInternalError(
                     "Step *%s* tries to join a foreach "
@@ -256,11 +263,37 @@ class MetaflowTask(object):
         x._set_datastore(datastore)
         return x
 
-    def clone_only(self, step_name, run_id, task_id, clone_origin_task, retry_count):
+    def clone_only(
+        self,
+        step_name,
+        run_id,
+        task_id,
+        clone_origin_task,
+        retry_count,
+        wait_only=False,
+    ):
         if not clone_origin_task:
             raise MetaflowInternalError(
-                "task.clone_only needs a valid " "clone_origin_task value."
+                "task.clone_only needs a valid clone_origin_task value."
             )
+        if wait_only:
+            # In this case, we are actually going to wait for the clone to be done
+            # by someone else. To do this, we just get the task_datastore in "r" mode
+            while True:
+                try:
+                    ds = self.flow_datastore.get_task_datastore(
+                        run_id, step_name, task_id
+                    )
+                    if not ds["_task_ok"]:
+                        raise MetaflowInternalError(
+                            "Externally cloned task did not succeed"
+                        )
+                    break
+                except DataException:
+                    # No need to get fancy with the sleep here.
+                    time.sleep(5)
+            return
+        # If we actually have to do the clone ourselves, proceed...
         # 1. initialize output datastore
         output = self.flow_datastore.get_task_datastore(
             run_id, step_name, task_id, attempt=0, mode="w"
@@ -290,6 +323,12 @@ class MetaflowTask(object):
                     field="origin-run-id",
                     value=str(origin_run_id),
                     type="origin-run-id",
+                    tags=metadata_tags,
+                ),
+                MetaDatum(
+                    field="attempt",
+                    value=str(retry_count),
+                    type="attempt",
                     tags=metadata_tags,
                 ),
             ],
@@ -348,7 +387,7 @@ class MetaflowTask(object):
             self.metadata.register_task_id(run_id, step_name, task_id, retry_count)
         else:
             raise MetaflowInternalError(
-                "task.run_step needs a valid run_id " "and task_id"
+                "task.run_step needs a valid run_id and task_id"
             )
 
         if retry_count >= MAX_ATTEMPTS:
@@ -356,7 +395,7 @@ class MetaflowTask(object):
             # by datastore, so running a task with such a retry_could would
             # be pointless and dangerous
             raise MetaflowInternalError(
-                "Too many task attempts (%d)! " "MAX_ATTEMPTS exceeded." % retry_count
+                "Too many task attempts (%d)! MAX_ATTEMPTS exceeded." % retry_count
             )
 
         metadata_tags = ["attempt_id:{0}".format(retry_count)]
@@ -424,7 +463,10 @@ class MetaflowTask(object):
             origin_run_id=origin_run_id,
             namespace=resolve_identity(),
             username=get_username(),
+            metadata_str="%s@%s"
+            % (self.metadata.__class__.TYPE, self.metadata.__class__.INFO),
             is_running=True,
+            tags=self.metadata.sticky_tags,
         )
 
         # 5. run task
@@ -442,9 +484,6 @@ class MetaflowTask(object):
         start = time.time()
         self.metadata.start_task_heartbeat(self.flow.name, run_id, step_name, task_id)
         try:
-            # init side cars
-            logger.start()
-
             msg = {
                 "task_id": task_id,
                 "msg": "task starting",
@@ -641,5 +680,4 @@ class MetaflowTask(object):
                 )
 
             # terminate side cars
-            logger.terminate()
             self.metadata.stop_heartbeat()

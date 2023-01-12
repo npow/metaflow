@@ -9,7 +9,9 @@ import random
 import uuid
 
 from metaflow.exception import MetaflowException, MetaflowInternalError
-from metaflow.plugins import ResourcesDecorator, BatchDecorator, RetryDecorator
+from metaflow.plugins.aws.batch.batch_decorator import BatchDecorator
+from metaflow.plugins.resources_decorator import ResourcesDecorator
+from metaflow.plugins.retry_decorator import RetryDecorator
 from metaflow.parameters import deploy_time_eval
 from metaflow.decorators import flow_decorators
 from metaflow.util import compress_list, dict_to_cli_options, to_pascalcase
@@ -18,6 +20,7 @@ from metaflow.metaflow_config import (
     EVENTS_SFN_ACCESS_IAM_ROLE,
     SFN_DYNAMO_DB_TABLE,
     SFN_EXECUTION_LOG_GROUP_ARN,
+    S3_ENDPOINT_URL,
 )
 from metaflow import R
 
@@ -25,8 +28,6 @@ from .step_functions_client import StepFunctionsClient
 from .event_bridge_client import EventBridgeClient
 from ..batch.batch import Batch
 from ..aws_utils import compute_resource_attributes
-
-from metaflow.mflog import capture_output_to_mflog
 
 
 class StepFunctionsException(MetaflowException):
@@ -86,7 +87,7 @@ class StepFunctions(object):
     def trigger_explanation(self):
         if self._cron:
             # Sometime in the future, we should vendor (or write) a utility
-            # that can translate cron specifications into a human readable
+            # that can translate cron specifications into a human-readable
             # format and push to the user for a better UX, someday.
             return (
                 "This workflow triggers automatically "
@@ -172,8 +173,8 @@ class StepFunctions(object):
         # Dump parameters into `Parameters` input field.
         input = json.dumps({"Parameters": json.dumps(parameters)})
         # AWS Step Functions limits input to be 32KiB, but AWS Batch
-        # has it's own limitation of 30KiB for job specification length.
-        # Reserving 10KiB for rest of the job sprecification leaves 20KiB
+        # has its own limitation of 30KiB for job specification length.
+        # Reserving 10KiB for rest of the job specification leaves 20KiB
         # for us, which should be enough for most use cases for now.
         if len(input) > 20480:
             raise StepFunctionsException(
@@ -413,7 +414,11 @@ class StepFunctions(object):
         env_deco = [deco for deco in node.decorators if deco.name == "environment"]
         env = {}
         if env_deco:
-            env = env_deco[0].attributes["vars"]
+            env = env_deco[0].attributes["vars"].copy()
+
+        # add METAFLOW_S3_ENDPOINT_URL
+        if S3_ENDPOINT_URL is not None:
+            env["METAFLOW_S3_ENDPOINT_URL"] = S3_ENDPOINT_URL
 
         if node.name == "start":
             # Initialize parameters for the flow in the `start` step.
@@ -461,7 +466,7 @@ class StepFunctions(object):
                     "${METAFLOW_PARENT_TASK_IDS}" % node.in_funcs[0]
                 )
                 # Unfortunately, AWS Batch only allows strings as value types
-                # in it's specification and we don't have any way to concatenate
+                # in its specification, and we don't have any way to concatenate
                 # the task ids array from the parent steps within AWS Step
                 # Functions and pass it down to AWS Batch. We instead have to
                 # rely on publishing the state to DynamoDb and fetching it back
@@ -519,7 +524,7 @@ class StepFunctions(object):
                         # parent tasks. We filter the Map state to only output
                         # `$.[0]`, since we don't need any of the other outputs,
                         # that information is available to us from AWS DynamoDB.
-                        # This has a nice side-effect of making our foreach
+                        # This has a nice side effect of making our foreach
                         # splits infinitely scalable because otherwise we would
                         # be bounded by the 32K state limit for the outputs. So,
                         # instead of referencing `Parameters` fields by index
@@ -591,7 +596,7 @@ class StepFunctions(object):
         # Set AWS DynamoDb Table Name for state tracking for for-eaches.
         # There are three instances when metaflow runtime directly interacts
         # with AWS DynamoDB.
-        #   1. To set the cardinality of foreaches (which are subsequently)
+        #   1. To set the cardinality of `foreach`s (which are subsequently)
         #      read prior to the instantiation of the Map state by AWS Step
         #      Functions.
         #   2. To set the input paths from the parent steps of a foreach join.
@@ -625,6 +630,10 @@ class StepFunctions(object):
                     "terminal."
                 )
             env["METAFLOW_SFN_DYNAMO_DB_TABLE"] = SFN_DYNAMO_DB_TABLE
+
+        # It makes no sense to set env vars to None (shows up as "None" string)
+        env_without_none_values = {k: v for k, v in env.items() if v is not None}
+        del env
 
         # Resolve AWS Batch resource requirements.
         batch_deco = [deco for deco in node.decorators if deco.name == "batch"][0]
@@ -672,7 +681,7 @@ class StepFunctions(object):
                 shared_memory=resources["shared_memory"],
                 max_swap=resources["max_swap"],
                 swappiness=resources["swappiness"],
-                env=env,
+                env=env_without_none_values,
                 attrs=attrs,
                 host_volumes=resources["host_volumes"],
             )
@@ -725,8 +734,8 @@ class StepFunctions(object):
             "--environment=%s" % self.environment.TYPE,
             "--datastore=%s" % self.flow_datastore.TYPE,
             "--datastore-root=%s" % self.flow_datastore.datastore_root,
-            "--event-logger=%s" % self.event_logger.logger_type,
-            "--monitor=%s" % self.monitor.monitor_type,
+            "--event-logger=%s" % self.event_logger.TYPE,
+            "--monitor=%s" % self.monitor.TYPE,
             "--no-pylint",
             "--with=step_functions_internal",
         ]
@@ -738,14 +747,10 @@ class StepFunctions(object):
             param_file = "".join(
                 random.choice(string.ascii_lowercase) for _ in range(10)
             )
-            export_params = " && ".join(
-                [
-                    capture_output_to_mflog(
-                        "python -m metaflow.plugins.aws.step_functions.set_batch_environment parameters %s"
-                        % param_file
-                    ),
-                    ". `pwd`/%s" % param_file,
-                ]
+            export_params = (
+                "python -m "
+                "metaflow.plugins.aws.step_functions.set_batch_environment "
+                "parameters %s && . `pwd`/%s" % (param_file, param_file)
             )
             params = (
                 entrypoint
@@ -761,7 +766,7 @@ class StepFunctions(object):
                 params.extend("--tag %s" % tag for tag in self.tags)
 
             # If the start step gets retried, we must be careful not to
-            # regenerate multiple parameters tasks. Hence we check first if
+            # regenerate multiple parameters tasks. Hence, we check first if
             # _parameters exists already.
             exists = entrypoint + [
                 "dump",
@@ -771,7 +776,7 @@ class StepFunctions(object):
             cmd = "if ! %s >/dev/null 2>/dev/null; then %s && %s; fi" % (
                 " ".join(exists),
                 export_params,
-                capture_output_to_mflog(" ".join(params)),
+                " ".join(params),
             )
             cmds.append(cmd)
             paths = "sfn-${METAFLOW_RUN_ID}/_parameters/%s" % (task_id_params)
@@ -780,7 +785,7 @@ class StepFunctions(object):
             parent_tasks_file = "".join(
                 random.choice(string.ascii_lowercase) for _ in range(10)
             )
-            export_parent_tasks = capture_output_to_mflog(
+            export_parent_tasks = (
                 "python -m "
                 "metaflow.plugins.aws.step_functions.set_batch_environment "
                 "parent_tasks %s && . `pwd`/%s" % (parent_tasks_file, parent_tasks_file)
@@ -806,7 +811,7 @@ class StepFunctions(object):
             step.extend("--tag %s" % tag for tag in self.tags)
         if self.namespace is not None:
             step.append("--namespace=%s" % self.namespace)
-        cmds.append(capture_output_to_mflog(" ".join(entrypoint + top_level + step)))
+        cmds.append(" ".join(entrypoint + top_level + step))
         return " && ".join(cmds)
 
 

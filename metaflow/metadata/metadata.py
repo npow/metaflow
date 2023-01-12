@@ -3,11 +3,11 @@ import os
 import re
 import time
 from collections import namedtuple
-from datetime import datetime
+from itertools import chain
 
-from metaflow.exception import MetaflowInternalError
-from metaflow.util import get_username, resolve_identity
-
+from metaflow.exception import MetaflowInternalError, MetaflowTaggingError
+from metaflow.tagging_util import validate_tag
+from metaflow.util import get_username, resolve_identity_as_tuple, is_stringish
 
 DataArtifact = namedtuple("DataArtifact", "name ds_type ds_root url type sha")
 
@@ -45,6 +45,33 @@ def with_metaclass(mcls):
         return mcls(cls.__name__, cls.__bases__, body)
 
     return decorator
+
+
+class ObjectOrder:
+    # Consider this list a constant that should never change.
+    # Lots of code depend on the membership of this list as
+    # well as exact ordering
+    _order_as_list = [
+        "root",
+        "flow",
+        "run",
+        "step",
+        "task",
+        "artifact",
+        "metadata",
+        "self",
+    ]
+    _order_as_dict = {v: i for i, v in enumerate(_order_as_list)}
+
+    @staticmethod
+    def order_to_type(order):
+        if order < len(ObjectOrder._order_as_list):
+            return ObjectOrder._order_as_list[order]
+        return None
+
+    @staticmethod
+    def type_to_order(obj_type):
+        return ObjectOrder._order_as_dict.get(obj_type)
 
 
 @with_metaclass(MetadataProviderMeta)
@@ -128,6 +155,10 @@ class MetadataProvider(object):
             Tags to apply to this particular run, by default None
         sys_tags : list, optional
             System tags to apply to this particular run, by default None
+        Returns
+        -------
+        bool
+            True if a new run was registered; False if it already existed
         """
         raise NotImplementedError()
 
@@ -173,6 +204,10 @@ class MetadataProvider(object):
             Tags to apply to this particular run, by default []
         sys_tags : list, optional
             System tags to apply to this particular run, by default []
+        Returns
+        -------
+        bool
+            True if a new run was registered; False if it already existed
         """
         raise NotImplementedError()
 
@@ -355,22 +390,12 @@ class MetadataProvider(object):
             object or list :
                 Depending on the call, the type of object return varies
         """
-        obj_order = {
-            "root": 0,
-            "flow": 1,
-            "run": 2,
-            "step": 3,
-            "task": 4,
-            "artifact": 5,
-            "metadata": 6,
-            "self": 7,
-        }
-        type_order = obj_order.get(obj_type)
-        sub_order = obj_order.get(sub_type)
+        type_order = ObjectOrder.type_to_order(obj_type)
+        sub_order = ObjectOrder.type_to_order(sub_type)
 
         if type_order is None:
             raise MetaflowInternalError(msg="Cannot find type %s" % obj_type)
-        if type_order > 5:
+        if type_order >= ObjectOrder.type_to_order("metadata"):
             raise MetaflowInternalError(msg="Type %s is not allowed" % obj_type)
 
         if sub_order is None:
@@ -400,17 +425,93 @@ class MetadataProvider(object):
         pre_filter = cls._get_object_internal(
             obj_type, type_order, sub_type, sub_order, filters, attempt_int, *args
         )
-        if attempt_int is None or sub_order != 6:
+        if attempt_int is None or sub_type != "metadata":
             # If no attempt or not for metadata, just return as is
             return pre_filter
         return MetadataProvider._reconstruct_metadata_for_attempt(
             pre_filter, attempt_int
         )
 
+    @classmethod
+    def mutate_user_tags_for_run(
+        cls, flow_id, run_id, tags_to_remove=None, tags_to_add=None
+    ):
+        """
+        Mutate the set of user tags for a run.
+
+        Removals logically get applied after additions.  Operations occur as a batch atomically.
+        Parameters
+        ----------
+        flow_id : str
+            Flow id, that the run belongs to.
+        run_id: str
+            Run id, together with flow_id, that identifies the specific Run whose tags to mutate
+        tags_to_remove: iterable over str
+            Iterable over tags to remove
+        tags_to_add: iterable over str
+            Iterable over tags to add
+
+        Return
+        ------
+        Run tags after mutation operations
+        """
+        # perform common validation, across all provider implementations
+        if tags_to_remove is None:
+            tags_to_remove = []
+        if tags_to_add is None:
+            tags_to_add = []
+        if not tags_to_add and not tags_to_remove:
+            raise MetaflowTaggingError("Must add or remove at least one tag")
+
+        if is_stringish(tags_to_add):
+            raise MetaflowTaggingError("tags_to_add may not be a string")
+
+        if is_stringish(tags_to_remove):
+            raise MetaflowTaggingError("tags_to_remove may not be a string")
+
+        def _is_iterable(something):
+            try:
+                iter(something)
+                return True
+            except TypeError:
+                return False
+
+        if not _is_iterable(tags_to_add):
+            raise MetaflowTaggingError("tags_to_add must be iterable")
+        if not _is_iterable(tags_to_remove):
+            raise MetaflowTaggingError("tags_to_remove must be iterable")
+
+        # check each tag is valid
+        for tag in chain(tags_to_add, tags_to_remove):
+            validate_tag(tag)
+
+        # onto subclass implementation
+        final_user_tags = cls._mutate_user_tags_for_run(
+            flow_id, run_id, tags_to_add=tags_to_add, tags_to_remove=tags_to_remove
+        )
+        return final_user_tags
+
+    @classmethod
+    def _mutate_user_tags_for_run(
+        cls, flow_id, run_id, tags_to_add=None, tags_to_remove=None
+    ):
+        """
+        To be implemented by subclasses of MetadataProvider.
+
+        See mutate_user_tags_for_run() for expectations.
+        """
+        raise NotImplementedError()
+
     def _all_obj_elements(self, tags=None, sys_tags=None):
+        return MetadataProvider._all_obj_elements_static(
+            self._flow_name, tags=tags, sys_tags=sys_tags
+        )
+
+    @staticmethod
+    def _all_obj_elements_static(flow_name, tags=None, sys_tags=None):
         user = get_username()
         return {
-            "flow_id": self._flow_name,
+            "flow_id": flow_name,
             "user_name": user,
             "tags": list(tags) if tags else [],
             "system_tags": list(sys_tags) if sys_tags else [],
@@ -424,11 +525,17 @@ class MetadataProvider(object):
         return {"flow_id": self._flow_name, "ts_epoch": int(round(time.time() * 1000))}
 
     def _run_to_json(self, run_id=None, tags=None, sys_tags=None):
+        return MetadataProvider._run_to_json_static(
+            self._flow_name, run_id=run_id, tags=tags, sys_tags=sys_tags
+        )
+
+    @staticmethod
+    def _run_to_json_static(flow_name, run_id=None, tags=None, sys_tags=None):
         if run_id is not None:
             d = {"run_number": run_id}
         else:
             d = {}
-        d.update(self._all_obj_elements(tags, sys_tags))
+        d.update(MetadataProvider._all_obj_elements_static(flow_name, tags, sys_tags))
         return d
 
     def _step_to_json(self, run_id, step_name, tags=None, sys_tags=None):
@@ -497,28 +604,55 @@ class MetadataProvider(object):
             for datum in metadata
         ]
 
-    def _tags(self):
+    def _get_system_info_as_dict(self):
+        """This function drives:
+        - sticky system tags initialization
+        - task-level metadata generation
+        """
+        sys_info = dict()
         env = self._environment.get_environment_info()
-        tags = [
-            resolve_identity(),
-            "runtime:" + env["runtime"],
-            "python_version:" + env["python_version_code"],
-            "date:" + datetime.utcnow().strftime("%Y-%m-%d"),
-        ]
+        sys_info["runtime"] = env["runtime"]
+        sys_info["python_version"] = env["python_version_code"]
+        identity_type, identity_value = resolve_identity_as_tuple()
+        sys_info[identity_type] = identity_value
         if env["metaflow_version"]:
-            tags.append("metaflow_version:" + env["metaflow_version"])
+            sys_info["metaflow_version"] = env["metaflow_version"]
         if "metaflow_r_version" in env:
-            tags.append("metaflow_r_version:" + env["metaflow_r_version"])
+            sys_info["metaflow_r_version"] = env["metaflow_r_version"]
         if "r_version_code" in env:
-            tags.append("r_version:" + env["r_version_code"])
-        return tags
+            sys_info["r_version"] = env["r_version_code"]
+        return sys_info
 
-    def _register_code_package_metadata(self, run_id, step_name, task_id, attempt):
+    def _get_system_tags(self):
+        """Convert system info dictionary into a list of system tags"""
+        return [
+            "{}:{}".format(k, v) for k, v in self._get_system_info_as_dict().items()
+        ]
+
+    def _register_system_metadata(self, run_id, step_name, task_id, attempt):
+        """Gather up system and code packaging info and register them as task metadata"""
         metadata = []
+        # Take everything from system info and store them as metadata
+        sys_info = self._get_system_info_as_dict()
+
+        # field, and type could get long in theory...can the metadata backend handle it?
+        # E.g. as of 5/9/2022 Metadata service's DB says VARCHAR(255).
+        # It is likely overkill to fail a flow over an over-flow. We should expect the
+        # backend to try to tolerate this (e.g. enlarge columns, truncation fallback).
+        metadata.extend(
+            MetaDatum(
+                field=str(k),
+                value=str(v),
+                type=str(k),
+                tags=["attempt_id:{0}".format(attempt)],
+            )
+            for k, v in sys_info.items()
+        )
+        # Also store code packaging information
         code_sha = os.environ.get("METAFLOW_CODE_SHA")
-        code_url = os.environ.get("METAFLOW_CODE_URL")
-        code_ds = os.environ.get("METAFLOW_CODE_DS")
         if code_sha:
+            code_url = os.environ.get("METAFLOW_CODE_URL")
+            code_ds = os.environ.get("METAFLOW_CODE_DS")
             metadata.append(
                 MetaDatum(
                     field="code-package",
@@ -529,8 +663,6 @@ class MetadataProvider(object):
                     tags=["attempt_id:{0}".format(attempt)],
                 )
             )
-        # We don't tag with attempt_id here because not readily available; this
-        # is ok though as this doesn't change from attempt to attempt.
         if metadata:
             self.register_metadata(run_id, step_name, task_id, metadata)
 
@@ -604,4 +736,4 @@ class MetadataProvider(object):
         self._monitor = monitor
         self._environment = environment
         self._runtime = os.environ.get("METAFLOW_RUNTIME_NAME", "dev")
-        self.add_sticky_tags(sys_tags=self._tags())
+        self.add_sticky_tags(sys_tags=self._get_system_tags())

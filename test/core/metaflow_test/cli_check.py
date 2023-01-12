@@ -1,9 +1,10 @@
-import os
 import sys
 import subprocess
 import json
+from collections import namedtuple
 from tempfile import NamedTemporaryFile
 
+from metaflow.includefile import IncludedFile
 from metaflow.util import is_stringish
 
 from . import (
@@ -23,22 +24,17 @@ except:
 
 
 class CliCheck(MetaflowCheck):
-    def run_cli(self, args, capture_output=False, pipe_error_to_output=False):
+    def run_cli(self, args):
         cmd = [sys.executable, "test_flow.py"]
 
         # remove --quiet from top level options to capture output from echo
         # we will add --quiet in args if needed
         cmd.extend([opt for opt in self.cli_options if opt != "--quiet"])
-
         cmd.extend(args)
-        options_kwargs = {}
-        if pipe_error_to_output:
-            options_kwargs["stderr"] = subprocess.STDOUT
 
-        if capture_output:
-            return subprocess.check_output(cmd, **options_kwargs)
-        else:
-            subprocess.check_call(cmd, **options_kwargs)
+        return subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
+        )
 
     def assert_artifact(self, step, name, value, fields=None):
         for task, artifacts in self.artifact_dict(step, name).items():
@@ -48,6 +44,8 @@ class CliCheck(MetaflowCheck):
                     for field, v in fields.items():
                         if is_stringish(artifact):
                             data = json.loads(artifact)
+                        elif isinstance(artifact, IncludedFile):
+                            data = json.loads(artifact.descriptor)
                         else:
                             data = artifact
                         if not isinstance(data, dict):
@@ -129,7 +127,7 @@ class CliCheck(MetaflowCheck):
                 step, task, card_type, card_hash=card_hash, card_id=card_id
             )
         except subprocess.CalledProcessError as e:
-            if no_card_found_message in e.output.decode("utf-8").strip():
+            if no_card_found_message in e.stderr.decode("utf-8").strip():
                 card_data = None
             else:
                 raise e
@@ -148,45 +146,87 @@ class CliCheck(MetaflowCheck):
         no_card_found_message = CardNotPresentException.headline
         try:
             card_data = self._list_cards(step, task=task, card_type=card_type)
-            card_data = json.loads(card_data)
         except subprocess.CalledProcessError as e:
-            if no_card_found_message in e.output.decode("utf-8").strip():
+            if no_card_found_message in e.stderr.decode("utf-8").strip():
                 card_data = None
             else:
                 raise e
         return card_data
 
     def _list_cards(self, step, task=None, card_type=None):
-        pathspec = "%s/%s" % (self.run_id, step)
-        if task is not None:
-            pathspec = "%s/%s/%s" % (self.run_id, step, task)
-        cmd = ["--quiet", "card", "list", pathspec, "--as-json"]
-        if card_type is not None:
-            cmd.extend(["--type", card_type])
+        with NamedTemporaryFile(dir=".") as f:
+            pathspec = "%s/%s" % (self.run_id, step)
+            if task is not None:
+                pathspec = "%s/%s/%s" % (self.run_id, step, task)
+            cmd = ["--quiet", "card", "list", pathspec, "--as-json", "--file", f.name]
+            if card_type is not None:
+                cmd.extend(["--type", card_type])
 
-        return self.run_cli(cmd, capture_output=True, pipe_error_to_output=True).decode(
-            "utf-8"
-        )
+            self.run_cli(cmd)
+            with open(f.name, "r") as jsf:
+                return json.load(jsf)
 
     def get_card(self, step, task, card_type, card_hash=None, card_id=None):
-        cmd = [
-            "--quiet",
-            "card",
-            "get",
-            "%s/%s/%s" % (self.run_id, step, task),
-            "--type",
-            card_type,
-        ]
+        with NamedTemporaryFile(dir=".") as f:
+            cmd = [
+                "--quiet",
+                "card",
+                "get",
+                "%s/%s/%s" % (self.run_id, step, task),
+                f.name,
+                "--type",
+                card_type,
+            ]
 
-        if card_hash is not None:
-            cmd.extend(["--hash", card_hash])
-        if card_id is not None:
-            cmd.extend(["--id", card_id])
+            if card_hash is not None:
+                cmd.extend(["--hash", card_hash])
+            if card_id is not None:
+                cmd.extend(["--id", card_id])
 
-        return self.run_cli(cmd, capture_output=True, pipe_error_to_output=True).decode(
-            "utf-8"
-        )
+            self.run_cli(cmd)
+            with open(f.name, "r") as jsf:
+                return jsf.read()
 
     def get_log(self, step, logtype):
         cmd = ["--quiet", "logs", "--%s" % logtype, "%s/%s" % (self.run_id, step)]
-        return self.run_cli(cmd, capture_output=True).decode("utf-8")
+        completed_process = self.run_cli(cmd)
+        return completed_process.stdout.decode("utf-8")
+
+    def get_user_tags(self):
+        completed_process = self.run_cli(
+            ["tag", "list", "--flat", "--hide-system-tags", "--run-id", self.run_id]
+        )
+        lines = completed_process.stderr.decode("utf-8").splitlines()[1:]
+        return frozenset(lines)
+
+    def get_system_tags(self):
+        completed_process = self.run_cli(
+            ["tag", "list", "--flat", "--run-id", self.run_id]
+        )
+        lines = completed_process.stderr.decode("utf-8").splitlines()[1:]
+        return frozenset(lines) - self.get_user_tags()
+
+    def add_tag(self, tag):
+        self.run_cli(["tag", "add", "--run-id", self.run_id, tag])
+
+    def add_tags(self, tags):
+        self.run_cli(["tag", "add", "--run-id", self.run_id, *tags])
+
+    def remove_tag(self, tag):
+        self.run_cli(["tag", "remove", "--run-id", self.run_id, tag])
+
+    def remove_tags(self, tags):
+        self.run_cli(["tag", "remove", "--run-id", self.run_id, *tags])
+
+    def replace_tag(self, tag_to_remove, tag_to_add):
+        self.run_cli(
+            ["tag", "replace", "--run-id", self.run_id, tag_to_remove, tag_to_add]
+        )
+
+    def replace_tags(self, tags_to_remove, tags_to_add):
+        cmd = ["tag", "replace", "--run-id", self.run_id]
+        for tag_to_remove in tags_to_remove:
+            cmd.extend(["--remove", tag_to_remove])
+        for tag_to_add in tags_to_add:
+            cmd.extend(["--add", tag_to_add])
+        self.run_cli(cmd)

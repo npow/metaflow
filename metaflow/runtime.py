@@ -14,7 +14,10 @@ from datetime import datetime
 from io import BytesIO
 from functools import partial
 
+from metaflow.datastore.exceptions import DataException
+
 from . import get_namespace
+from .metadata import MetaDatum
 from .metaflow_config import MAX_ATTEMPTS
 from .exception import (
     MetaflowException,
@@ -36,7 +39,8 @@ from .unbounded_foreach import (
 MAX_WORKERS = 16
 MAX_NUM_SPLITS = 100
 MAX_LOG_SIZE = 1024 * 1024
-PROGRESS_INTERVAL = 1000  # ms
+POLL_TIMEOUT = 1000  # ms
+PROGRESS_INTERVAL = 300  # s
 # The following is a list of the (data) artifacts used by the runtime while
 # executing a flow. These are prefetched during the resume operation by
 # leveraging the TaskDataStoreSet.
@@ -64,6 +68,8 @@ class NativeRuntime(object):
         monitor,
         run_id=None,
         clone_run_id=None,
+        clone_only=False,
+        reentrant=False,
         clone_steps=None,
         max_workers=MAX_WORKERS,
         max_num_splits=MAX_NUM_SPLITS,
@@ -83,7 +89,11 @@ class NativeRuntime(object):
         self._environment = environment
         self._logger = logger
         self._max_workers = max_workers
-        self._num_active_workers = 0
+        self._active_tasks = dict()  # Key: step name;
+        # value: [number of running tasks, number of done tasks]
+        # Special key 0 is total number of running tasks
+        self._active_tasks[0] = 0
+        self._unprocessed_steps = set([n.name for n in self._graph])
         self._max_num_splits = max_num_splits
         self._max_log_size = max_log_size
         self._params_task = None
@@ -92,7 +102,9 @@ class NativeRuntime(object):
         self._monitor = monitor
 
         self._clone_run_id = clone_run_id
+        self._clone_only = clone_only
         self._clone_steps = {} if clone_steps is None else clone_steps
+        self._reentrant = reentrant
 
         self._origin_ds_set = None
         if clone_run_id:
@@ -166,6 +178,8 @@ class NativeRuntime(object):
             input_paths=input_paths,
             may_clone=may_clone,
             clone_run_id=self._clone_run_id,
+            clone_only=self._clone_only,
+            reentrant=self._reentrant,
             origin_ds_set=self._origin_ds_set,
             decos=decos,
             logger=self._logger,
@@ -198,7 +212,7 @@ class NativeRuntime(object):
         try:
             # main scheduling loop
             exception = None
-            while self._run_queue or self._num_active_workers > 0:
+            while self._run_queue or self._active_tasks[0] > 0:
 
                 # 1. are any of the current workers finished?
                 finished_tasks = list(self._poll_workers())
@@ -210,15 +224,46 @@ class NativeRuntime(object):
 
                 if time.time() - progress_tstamp > PROGRESS_INTERVAL:
                     progress_tstamp = time.time()
-                    msg = "%d tasks are running: %s." % (
-                        self._num_active_workers,
-                        "e.g. ...",
-                    )  # TODO
+                    tasks_print = ", ".join(
+                        [
+                            "%s (%d running; %d done)" % (k, v[0], v[1])
+                            for k, v in self._active_tasks.items()
+                            if k != 0 and v[0] > 0
+                        ]
+                    )
+                    if self._active_tasks[0] == 0:
+                        msg = "No tasks are running."
+                    else:
+                        if self._active_tasks[0] == 1:
+                            msg = "1 task is running: "
+                        else:
+                            msg = "%d tasks are running: " % self._active_tasks[0]
+                        msg += "%s." % tasks_print
+
                     self._logger(msg, system_msg=True)
-                    msg = "%d tasks are waiting in the queue." % len(self._run_queue)
+
+                    if len(self._run_queue) == 0:
+                        msg = "No tasks are waiting in the queue."
+                    else:
+                        if len(self._run_queue) == 1:
+                            msg = "1 task is waiting in the queue: "
+                        else:
+                            msg = "%d tasks are waiting in the queue." % len(
+                                self._run_queue
+                            )
+
                     self._logger(msg, system_msg=True)
-                    msg = "%d steps are pending: %s." % (0, "e.g. ...")  # TODO
-                    self._logger(msg, system_msg=True)
+                    if len(self._unprocessed_steps) > 0:
+                        if len(self._unprocessed_steps) == 1:
+                            msg = "%s step has not started" % (
+                                next(iter(self._unprocessed_steps)),
+                            )
+                        else:
+                            msg = "%d steps have not started: " % len(
+                                self._unprocessed_steps
+                            )
+                            msg += "%s." % ", ".join(self._unprocessed_steps)
+                        self._logger(msg, system_msg=True)
 
         except KeyboardInterrupt as ex:
             self._logger("Workflow interrupted.", system_msg=True, bad=True)
@@ -241,9 +286,15 @@ class NativeRuntime(object):
         # assert that end was executed and it was successful
         if ("end", ()) in self._finished:
             self._logger("Done!", system_msg=True)
+        elif self._clone_only:
+            self._logger(
+                "Clone-only resume complete -- only previously successful steps were "
+                "cloned; no new tasks executed!",
+                system_msg=True,
+            )
         else:
             raise MetaflowInternalError(
-                "The *end* step was not successful " "by the end of flow."
+                "The *end* step was not successful by the end of flow."
             )
 
     def _killall(self):
@@ -278,9 +329,11 @@ class NativeRuntime(object):
     # onto the run_queue is an inexpensive operation.
     def _queue_push(self, step, task_kwargs):
         self._run_queue.insert(0, (step, task_kwargs))
+        # For foreaches, this will happen multiple time but is ok, becomes a no-op
+        self._unprocessed_steps.discard(step)
 
     def _queue_pop(self):
-        return self._run_queue.pop() if self._run_queue else None
+        return self._run_queue.pop() if self._run_queue else (None, {})
 
     def _queue_task_join(self, task, next_steps):
         # if the next step is a join, we need to check that
@@ -518,7 +571,7 @@ class NativeRuntime(object):
 
     def _poll_workers(self):
         if self._workers:
-            for event in self._poll.poll(PROGRESS_INTERVAL):
+            for event in self._poll.poll(POLL_TIMEOUT):
                 worker = self._workers.get(event.fd)
                 if worker:
                     if event.can_read:
@@ -529,7 +582,13 @@ class NativeRuntime(object):
                         for fd in worker.fds():
                             self._poll.remove(fd)
                             del self._workers[fd]
-                        self._num_active_workers -= 1
+                        step_counts = self._active_tasks[worker.task.step]
+                        step_counts[0] -= 1  # One less task for this step is running
+                        step_counts[1] += 1  # ... and one more completed.
+                        # We never remove from self._active_tasks because it is possible
+                        # for all currently running task for a step to complete but
+                        # for others to still be queued up.
+                        self._active_tasks[0] -= 1
 
                         task = worker.task
                         if returncode:
@@ -539,7 +598,7 @@ class NativeRuntime(object):
                                 or returncode == METAFLOW_EXIT_DISALLOW_RETRY
                             ):
                                 self._logger(
-                                    "This failed task will not be " "retried.",
+                                    "This failed task will not be retried.",
                                     system_msg=True,
                                 )
                             else:
@@ -555,7 +614,7 @@ class NativeRuntime(object):
                             yield task
 
     def _launch_workers(self):
-        while self._run_queue and self._num_active_workers < self._max_workers:
+        while self._run_queue and self._active_tasks[0] < self._max_workers:
             step, task_kwargs = self._queue_pop()
             # Initialize the task (which can be expensive using remote datastores)
             # before launching the worker so that cost is amortized over time, instead
@@ -578,11 +637,26 @@ class NativeRuntime(object):
         self._launch_worker(worker.task)
 
     def _launch_worker(self, task):
+        if self._clone_only and not task.is_cloned:
+            # We don't launch a worker here
+            self._logger(
+                "Not executing non-cloned task for step '%s' in clone-only resume"
+                % "/".join([task.flow_name, task.run_id, task.step]),
+                system_msg=True,
+            )
+            return
+
         worker = Worker(task, self._max_log_size)
         for fd in worker.fds():
             self._workers[fd] = worker
             self._poll.add(fd)
-        self._num_active_workers += 1
+        active_step_counts = self._active_tasks.setdefault(task.step, [0, 0])
+
+        # We have an additional task for this step running
+        active_step_counts[0] += 1
+
+        # One more task actively running
+        self._active_tasks[0] += 1
 
 
 class Task(object):
@@ -600,53 +674,31 @@ class Task(object):
         event_logger,
         monitor,
         input_paths=None,
+        may_clone=False,
+        clone_run_id=None,
+        clone_only=False,
+        reentrant=False,
+        origin_ds_set=None,
+        decos=None,
+        logger=None,
+        # Anything below this is passed as part of kwargs
         split_index=None,
         ubf_context=None,
         ubf_iter=None,
-        clone_run_id=None,
-        origin_ds_set=None,
-        may_clone=False,
         join_type=None,
-        logger=None,
         task_id=None,
-        decos=[],
     ):
-        if ubf_context == UBF_CONTROL:
-            [input_path] = input_paths
-            run, input_step, input_task = input_path.split("/")
-            # We associate the control task-id to be 1:1 with the split node
-            # where the unbounded-foreach was defined.
-            # We prefer encoding the corresponding split into the task_id of
-            # the control node; so it has access to this information quite
-            # easily. There is anyway a corresponding int id stored in the
-            # metadata backend - so this should be fine.
-            task_id = "control-%s-%s-%s" % (run, input_step, input_task)
-        # Register only regular Metaflow (non control) tasks.
-        if task_id is None:
-            task_id = str(metadata.new_task_id(run_id, step))
-        else:
-            # task_id is preset only by persist_constants() or control tasks.
-            if ubf_context == UBF_CONTROL:
-                tags = [CONTROL_TASK_TAG]
-                metadata.register_task_id(
-                    run_id,
-                    step,
-                    task_id,
-                    0,
-                    sys_tags=tags,
-                )
-            else:
-                metadata.register_task_id(run_id, step, task_id, 0)
 
         self.step = step
         self.flow_name = flow.name
         self.run_id = run_id
-        self.task_id = task_id
+        self.task_id = None
+        self._path = None
         self.input_paths = input_paths
         self.split_index = split_index
         self.ubf_context = ubf_context
         self.ubf_iter = ubf_iter
-        self.decos = decos
+        self.decos = [] if decos is None else decos
         self.entrypoint = entrypoint
         self.environment = environment
         self.environment_type = self.environment.TYPE
@@ -658,15 +710,14 @@ class Task(object):
         self.monitor = monitor
 
         self._logger = logger
-        self._path = "%s/%s/%s" % (self.run_id, self.step, self.task_id)
 
         self.retries = 0
         self.user_code_retries = 0
         self.error_retries = 0
 
         self.tags = metadata.sticky_tags
-        self.event_logger_type = self.event_logger.logger_type
-        self.monitor_type = monitor.monitor_type
+        self.event_logger_type = self.event_logger.TYPE
+        self.monitor_type = monitor.TYPE
 
         self.metadata_type = metadata.TYPE
         self.datastore_type = flow_datastore.TYPE
@@ -674,10 +725,119 @@ class Task(object):
         self.datastore_sysroot = flow_datastore.datastore_root
         self._results_ds = None
 
+        origin = None
         if clone_run_id and may_clone:
-            self._is_cloned = self._attempt_clone(clone_run_id, join_type)
+            origin = self._find_origin_task(clone_run_id, join_type)
+        if origin and origin["_task_ok"]:
+            # At this point, we know we are going to clone
+            self._is_cloned = True
+            if reentrant:
+                # A re-entrant clone basically allows multiple concurrent processes
+                # to perform the clone at the same time to the same new run id. Let's
+                # assume two processes A and B both simultaneously calling
+                # `resume --reentrant --run-id XX`.
+                # For each task that is cloned, we want to guarantee that:
+                #   - one and only one of A or B will do the actual cloning
+                #   - the other process (or other processes) will block until the cloning
+                #     is complete.
+                # This ensures that the rest of the clone algorithm can proceed as normal
+                # and also guarantees that we only write once to the datastore and
+                # metadata.
+                #
+                # To accomplish this, we use the cloned task's task-id as the "key" to
+                # synchronize on. We then try to "register" this new task-id (or rather
+                # the full pathspec <run>/<step>/<taskid>) with the metadata service
+                # which will indicate if we actually registered it or if it existed
+                # already. If we did manage to register it, we are the "elected cloner"
+                # in essence and proceed to clone. If we didn't, we just wait to make
+                # sure the task is fully done (ie: the clone is finished).
+                if task_id is not None:
+                    # Sanity check -- this should never happen. We cannot allow
+                    # for explicit task-ids because in the reentrant case, we use the
+                    # cloned task's id as the new task's id.
+                    raise MetaflowInternalError(
+                        "Reentrant clone-only resume does not allow for explicit task-id"
+                    )
+
+                # We will use the same task_id as the original task
+                # to use it effectively as a synchronization key
+                clone_task_id = origin.task_id
+                # Make sure the task-id is a non-integer to not clash with task ids
+                # assigned by the metadata provider. If this is an integer, we
+                # add some string to it. It doesn't matter what we add as long as it is
+                # consistent.
+                try:
+                    clone_task_int = int(clone_task_id)
+                    clone_task_id = "resume-%d" % clone_task_int
+                except ValueError:
+                    pass
+
+                # If _get_task_id returns True it means the task already existed, so
+                # we wait for it.
+                self._wait_for_clone = self._get_task_id(clone_task_id)
+            else:
+                self._wait_for_clone = False
+                self._get_task_id(task_id)
+
+            # Store the mapping from current_pathspec -> origin_pathspec which
+            # will be useful for looking up origin_ds_set in find_origin_task.
+            self.clone_pathspec_mapping[self._path] = origin.pathspec
+            if self.step == "_parameters":
+                # We don't put _parameters on the queue so we either clone it or wait
+                # for it.
+                if not self._wait_for_clone:
+                    # Clone in place without relying on run_queue.
+                    self.new_attempt()
+                    self._ds.clone(origin)
+                    self._ds.done()
+                else:
+                    # TODO: There is a bit of a duplication with the task.py
+                    # clone_only function here
+                    self.log(
+                        "Waiting for clone of _parameters step to occur...",
+                        system_msg=True,
+                    )
+                    while True:
+                        try:
+                            ds = self._flow_datastore.get_task_datastore(
+                                self.run_id, self.step, self.task_id
+                            )
+                            if not ds["_task_ok"]:
+                                raise MetaflowInternalError(
+                                    "Externally cloned _parameters task did not succeed"
+                                )
+                            break
+                        except DataException:
+                            self.log("Sleeping for 5s...", system_msg=True)
+                            # No need to get fancy with the sleep here.
+                            time.sleep(5)
+                    self.log("_parameters clone successful", system_msg=True)
+            else:
+                # For non parameter steps
+                # Store the origin pathspec in clone_origin so this can be run
+                # as a task by the runtime.
+                self.clone_origin = origin.pathspec
+                # Save a call to creating the results_ds since its same as origin.
+                self._results_ds = origin
+                if self._wait_for_clone:
+                    self.log(
+                        "Waiting for the successful cloning of results "
+                        "of a previously run task %s (this may take some time)"
+                        % self.clone_origin,
+                        system_msg=True,
+                    )
+                else:
+                    self.log(
+                        "Cloning results of a previously run task %s"
+                        % self.clone_origin,
+                        system_msg=True,
+                    )
         else:
             self._is_cloned = False
+            if clone_only:
+                # We are done -- we don't proceed to create new task-ids
+                return
+            self._get_task_id(task_id)
 
         # Open the output datastore only if the task is not being cloned.
         if not self._is_cloned:
@@ -732,6 +892,63 @@ class Task(object):
         self._logger(msg, head=prefix, system_msg=system_msg, timestamp=timestamp)
         sys.stdout.flush()
 
+    def _get_task_id(self, task_id):
+        already_existed = True
+        if self.ubf_context == UBF_CONTROL:
+            [input_path] = self.input_paths
+            run, input_step, input_task = input_path.split("/")
+            # We associate the control task-id to be 1:1 with the split node
+            # where the unbounded-foreach was defined.
+            # We prefer encoding the corresponding split into the task_id of
+            # the control node; so it has access to this information quite
+            # easily. There is anyway a corresponding int id stored in the
+            # metadata backend - so this should be fine.
+            task_id = "control-%s-%s-%s" % (run, input_step, input_task)
+        # Register only regular Metaflow (non control) tasks.
+        if task_id is None:
+            task_id = str(self.metadata.new_task_id(self.run_id, self.step))
+            already_existed = False
+        else:
+            # task_id is preset only by persist_constants() or control tasks.
+            if self.ubf_context == UBF_CONTROL:
+                tags = [CONTROL_TASK_TAG]
+                attempt_id = 0
+                already_existed = not self.metadata.register_task_id(
+                    self.run_id,
+                    self.step,
+                    task_id,
+                    attempt_id,
+                    sys_tags=tags,
+                )
+                # A Task's tags are now those of its ancestral Run, so we are not able
+                # to rely on a task's tags to indicate the presence of a control task
+                # so, on top of adding the tags above, we also add a task metadata
+                # entry indicating that this is a "control task".
+                #
+                # Here we will also add a task metadata entry to indicate "control task".
+                # Within the metaflow repo, the only dependency of such a "control task"
+                # indicator is in the integration test suite (see Step.control_tasks() in
+                # client API).
+                task_metadata_list = [
+                    MetaDatum(
+                        field="internal_task_type",
+                        value=CONTROL_TASK_TAG,
+                        type="internal_task_type",
+                        tags=["attempt_id:{0}".format(attempt_id)],
+                    )
+                ]
+                self.metadata.register_metadata(
+                    self.run_id, self.step, task_id, task_metadata_list
+                )
+            else:
+                already_existed = not self.metadata.register_task_id(
+                    self.run_id, self.step, task_id, 0
+                )
+
+        self.task_id = task_id
+        self._path = "%s/%s/%s" % (self.run_id, self.step, self.task_id)
+        return already_existed
+
     def _find_origin_task(self, clone_run_id, join_type):
         if self.step == "_parameters":
             pathspec = "%s/_parameters[]" % clone_run_id
@@ -769,32 +986,6 @@ class Task(object):
             pathspec = "%s/%s[%s]" % (clone_run_id, self.step, index)
             return self.origin_ds_set.get_with_pathspec_index(pathspec)
 
-    def _attempt_clone(self, clone_run_id, join_type):
-        origin = self._find_origin_task(clone_run_id, join_type)
-
-        if origin and origin["_task_ok"]:
-            # Store the mapping from current_pathspec -> origin_pathspec which
-            # will be useful for looking up origin_ds_set in find_origin_task.
-            self.clone_pathspec_mapping[self._path] = origin.pathspec
-            if self.step == "_parameters":
-                # Clone in place without relying on run_queue.
-                self.new_attempt()
-                self._ds.clone(origin)
-                self._ds.done()
-            else:
-                self.log(
-                    "Cloning results of a previously run task %s" % origin.pathspec,
-                    system_msg=True,
-                )
-                # Store the origin pathspec in clone_origin so this can be run
-                # as a task by the runtime.
-                self.clone_origin = origin.pathspec
-                # Save a call to creating the results_ds since its same as origin.
-                self._results_ds = origin
-            return True
-        else:
-            return False
-
     @property
     def path(self):
         return self._path
@@ -817,6 +1008,10 @@ class Task(object):
     @property
     def is_cloned(self):
         return self._is_cloned
+
+    @property
+    def wait_for_clone(self):
+        return self._wait_for_clone
 
     def persist(self, flow):
         # this is used to persist parameters before the start step
@@ -890,6 +1085,7 @@ class CLIArgs(object):
             "metadata": self.task.metadata_type,
             "environment": self.task.environment_type,
             "datastore": self.task.datastore_type,
+            "pylint": False,
             "event-logger": self.task.event_logger_type,
             "monitor": self.task.monitor_type,
             "datastore-root": self.task.datastore_sysroot,
@@ -928,7 +1124,7 @@ class CLIArgs(object):
             for k, v in mapping.items():
 
                 # None or False arguments are ignored
-                # v needs to be explicitly False, not falsy, eg. 0 is an acceptable value
+                # v needs to be explicitly False, not falsy, e.g. 0 is an acceptable value
                 if v is None or v is False:
                     continue
 
@@ -989,7 +1185,7 @@ class Worker(object):
         # A killed task is always considered cleaned
         self.cleaned = False  # A cleaned task is one that is shutting down and has been
         # noticed by the runtime and queried for its state (whether or
-        # not is is properly shut down)
+        # not it is properly shut down)
 
     def _launch(self):
         args = CLIArgs(self.task)
@@ -1000,8 +1196,11 @@ class Worker(object):
 
         if self.task.is_cloned and self.task.clone_origin:
             args.command_options["clone-only"] = self.task.clone_origin
-            # disabling atlas sidecar for cloned tasks due to perf reasons
+            # disabling sidecars for cloned tasks due to perf reasons
+            args.top_level_options["event-logger"] = "nullSidecarLogger"
             args.top_level_options["monitor"] = "nullSidecarMonitor"
+            if self.task.wait_for_clone:
+                args.command_options["clone-wait-only"] = True
         else:
             # decorators may modify the CLIArgs object in-place
             for deco in self.task.decos:
@@ -1037,7 +1236,7 @@ class Worker(object):
                 if res.should_persist:
                     # in special circumstances we may receive structured
                     # loglines that haven't been properly persisted upstream.
-                    # This is the case e.g. if a task crashes in an external
+                    # This is the case if, for example, a task crashes in an external
                     # system and we retrieve the remaining logs after the crash.
                     # Those lines are marked with a special tag, should_persist,
                     # which we process here

@@ -6,7 +6,7 @@ from .basic import SerializationErrorComponent
 
 
 def _render_component_safely(
-    component, render_func, *args, return_error_component=True, **kwargs
+    component, render_func, return_error_component, *args, **kwargs
 ):
     rendered_obj = None
     try:
@@ -38,12 +38,10 @@ def _render_component_safely(
 def render_safely(func):
     """
     This is a decorator that can be added to any `MetaflowCardComponent.render`
-    The goal is to render sub components safely and ensure that they are JSON serializable.
+    The goal is to render subcomponents safely and ensure that they are JSON serializable.
     """
     # expects a renderer func
     def ret_func(self, *args, **kwargs):
-        return _render_component_safely(
-            self, func, *args, return_error_component=True, **kwargs
-        )
+        return _render_component_safely(self, func, True, *args, **kwargs)
 
     return ret_func

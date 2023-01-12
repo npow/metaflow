@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import sys
 from hashlib import sha1
@@ -17,14 +18,13 @@ from metaflow.decorators import StepDecorator
 from metaflow.extension_support import EXT_PKG
 from metaflow.metaflow_environment import InvalidEnvironmentException
 from metaflow.metadata import MetaDatum
-from metaflow.metaflow_config import get_pinned_conda_libs, CONDA_PACKAGE_S3ROOT
+from metaflow.metaflow_config import (
+    get_pinned_conda_libs,
+)
 from metaflow.util import get_metaflow_root
-from metaflow.datastore import LocalStorage
-from metaflow.datatools import S3
-from metaflow.unbounded_foreach import UBF_CONTROL
 
 from ..env_escape import generate_trampolines
-from . import read_conda_manifest, write_to_conda_manifest
+from . import read_conda_manifest, write_to_conda_manifest, get_conda_package_root
 from .conda import Conda
 
 try:
@@ -36,27 +36,23 @@ except NameError:
 
 class CondaStepDecorator(StepDecorator):
     """
-    Conda decorator that sets the Conda environment for your step
+    Specifies the Conda environment for the step.
 
-    To use, add this decorator to your step:
-    ```
-    @conda
-    @step
-    def MyStep(self):
-        ...
-    ```
+    Information in this decorator will augment any
+    attributes set in the `@conda_base` flow-level decorator. Hence,
+    you can use `@conda_base` to set common libraries required by all
+    steps and use `@conda` to specify step-specific additions.
 
-    Information in this decorator will override any eventual @conda_base flow level decorator.
     Parameters
     ----------
     libraries : Dict
-        Libraries to use for this flow. The key is the name of the package and the value
-        is the version to use. Defaults to {}
+        Libraries to use for this step. The key is the name of the package
+        and the value is the version to use (default: `{}`).
     python : string
-        Version of Python to use (for example: '3.7.4'). Defaults to None
-        (will use the current python version)
+        Version of Python to use, e.g. '3.7.4'
+        (default: None, i.e. the current Python version).
     disabled : bool
-        If set to True, disables Conda. Defaults to False
+        If set to True, disables Conda (default: False).
     """
 
     name = "conda"
@@ -93,18 +89,12 @@ class CondaStepDecorator(StepDecorator):
         )
 
     def _lib_deps(self):
-        deps = get_pinned_conda_libs(self._python_version())
+        deps = get_pinned_conda_libs(self._python_version(), self.flow_datastore.TYPE)
 
         base_deps = self.base_attributes["libraries"]
         deps.update(base_deps)
         step_deps = self.attributes["libraries"]
-        if isinstance(step_deps, (unicode, basestring)):
-            step_deps = step_deps.strip("\"{}'")
-            if step_deps:
-                step_deps = dict(
-                    map(lambda x: x.strip().strip("\"'"), a.split(":"))
-                    for a in step_deps.split(",")
-                )
+
         deps.update(step_deps)
         return deps
 
@@ -154,7 +144,11 @@ class CondaStepDecorator(StepDecorator):
                 }
             else:
                 payload = cached_deps[env_id]
-            if self.flow_datastore.TYPE == "s3" and "cache_urls" not in payload:
+
+            if (
+                self.flow_datastore.TYPE in ("s3", "azure", "gs")
+                and "cache_urls" not in payload
+            ):
                 payload["cache_urls"] = self._cache_env()
             write_to_conda_manifest(ds_root, self.flow.name, env_id, payload)
             CondaStepDecorator.environments = CondaStepDecorator.conda.environments(
@@ -163,6 +157,9 @@ class CondaStepDecorator(StepDecorator):
         return env_id
 
     def _cache_env(self):
+        # Move here to avoid circular imports
+        from metaflow.plugins import DATASTORES
+
         def _download(entry):
             url, local_path = entry
             with requests.get(url, stream=True) as r:
@@ -175,27 +172,41 @@ class CondaStepDecorator(StepDecorator):
         for package_info in self.conda.package_info(env_id):
             url = urlparse(package_info["url"])
             path = os.path.join(
-                CONDA_PACKAGE_S3ROOT,
                 url.netloc,
                 url.path.lstrip("/"),
                 package_info["md5"],
                 package_info["fn"],
             )
             tarball_path = package_info["package_tarball_full_path"]
-            if tarball_path.endswith(".conda"):
-                # Conda doesn't set the metadata correctly for certain fields
-                # when the underlying OS is spoofed.
-                tarball_path = tarball_path[:-6]
-            if not tarball_path.endswith(".tar.bz2"):
-                tarball_path = "%s.tar.bz2" % tarball_path
+            # we were originally restricted to just .tar.bz2 packages
+            # due to https://github.com/conda/conda/issues/9674
+            # which doesn't seem to be the case anymore
+            if not tarball_path.endswith(".conda") and not tarball_path.endswith(
+                ".tar.bz2"
+            ):
+                tarball_path_suffix = ".tar.bz2"
+                if package_info["url"].endswith(".conda"):
+                    tarball_path_suffix = ".conda"
+                tarball_path = "%s%s" % (tarball_path, tarball_path_suffix)
             if not os.path.isfile(tarball_path):
                 # The tarball maybe missing when user invokes `conda clean`!
                 to_download.append((package_info["url"], tarball_path))
             files.append((path, tarball_path))
         if to_download:
             Pool(8).map(_download, to_download)
-        with S3() as s3:
-            s3.put_files(files, overwrite=False)
+
+        list_of_path_and_filehandle = [
+            (path, open(tarball_path, "rb")) for path, tarball_path in files
+        ]
+
+        # We need our own storage backend so that we can customize datastore_root on it
+        # in a clearly safe way, without the existing backend owned by FlowDatastore
+        storage_impl = [d for d in DATASTORES if d.TYPE == self.flow_datastore.TYPE][0]
+        storage = storage_impl(get_conda_package_root(self.flow_datastore.TYPE))
+        storage.save_bytes(
+            list_of_path_and_filehandle, len_hint=len(list_of_path_and_filehandle)
+        )
+
         return [files[0] for files in files]
 
     def _prepare_step_environment(self, step_name, ds_root):
@@ -235,7 +246,11 @@ class CondaStepDecorator(StepDecorator):
         if platform.system() == "Linux":
             return "linux-%s" % bit
         elif platform.system() == "Darwin":
-            return "osx-%s" % bit
+            # Support M1 Mac
+            if platform.machine() == "arm64":
+                return "osx-arm64"
+            else:
+                return "osx-%s" % bit
         else:
             raise InvalidEnvironmentException(
                 "The *@conda* decorator is not supported "
@@ -250,12 +265,23 @@ class CondaStepDecorator(StepDecorator):
         self.addl_paths = None
         os.symlink(path_to_metaflow, os.path.join(self.metaflow_home, "metaflow"))
 
-        # Also symlink the INFO version to properly propagate down version information
-        # from, for example, a step-function execution
+        # Symlink the INFO file as well to properly propagate down the Metaflow version
+        # if launching on AWS Batch for example
         if os.path.isfile(path_to_info):
             os.symlink(path_to_info, os.path.join(self.metaflow_home, "INFO"))
+        else:
+            # If there is no "INFO" file, we will actually create one in this new
+            # place because we won't be able to properly resolve the EXT_PKG extensions
+            # the same way as outside conda (looking at distributions, etc.). In a
+            # Conda environment, as shown below (where we set self.addl_paths), all
+            # EXT_PKG extensions are PYTHONPATH extensions. Instead of re-resolving,
+            # we use the resolved information that is written out to the INFO file.
+            with open(
+                os.path.join(self.metaflow_home, "INFO"), mode="wt", encoding="utf-8"
+            ) as f:
+                f.write(json.dumps(self._cur_environment.get_environment_info()))
 
-        # Do the same for metaflow_extensions
+        # Do the same for EXT_PKG
         try:
             m = importlib.import_module(EXT_PKG)
         except ImportError:
@@ -263,23 +289,36 @@ class CondaStepDecorator(StepDecorator):
             # for other issues when loading at the toplevel
             pass
         else:
-            custom_paths = list(m.__path__)
+            custom_paths = list(set(m.__path__))  # For some reason, at times, unique
+            # paths appear multiple times. We simplify
+            # to avoid un-necessary links
+
             if len(custom_paths) == 1:
-                # Regular package
+                # Regular package; we take a quick shortcut here
                 os.symlink(
                     custom_paths[0],
                     os.path.join(self.metaflow_home, EXT_PKG),
                 )
             else:
-                # Namespace package; we don't symlink but add the additional paths
-                # for the conda interpreter
-                self.addl_paths = [os.path.split(p)[0] for p in custom_paths]
+                # This is a namespace package, we therefore create a bunch of directories
+                # so that we can symlink in those separately, and we will add those paths
+                # to the PYTHONPATH for the interpreter. Note that we don't symlink
+                # to the parent of the package because that could end up including
+                # more stuff we don't want
+                self.addl_paths = []
+                for p in custom_paths:
+                    temp_dir = tempfile.mkdtemp(dir=self.metaflow_home)
+                    os.symlink(p, os.path.join(temp_dir, EXT_PKG))
+                    self.addl_paths.append(temp_dir)
 
         # Also install any environment escape overrides directly here to enable
         # the escape to work even in non metaflow-created subprocesses
         generate_trampolines(self.metaflow_home)
 
     def step_init(self, flow, graph, step, decos, environment, flow_datastore, logger):
+        # Move here to avoid circular import
+        from metaflow.plugins.datastores.local_storage import LocalStorage
+
         if environment.TYPE != "conda":
             raise InvalidEnvironmentException(
                 "The *@conda* decorator requires " "--environment=conda"
@@ -299,6 +338,7 @@ class CondaStepDecorator(StepDecorator):
         os.environ["PYTHONNOUSERSITE"] = "1"
 
     def package_init(self, flow, step, environment):
+        self._cur_environment = environment
         if self.is_enabled():
             self._prepare_step_environment(step, self.local_root)
 

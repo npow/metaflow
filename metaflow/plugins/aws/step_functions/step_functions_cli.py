@@ -6,10 +6,14 @@ import re
 from distutils.version import LooseVersion
 
 from metaflow import current, decorators, parameters, JSONType
-from metaflow.metaflow_config import SFN_STATE_MACHINE_PREFIX
+from metaflow.metaflow_config import (
+    SERVICE_VERSION_CHECK,
+    SFN_STATE_MACHINE_PREFIX,
+)
 from metaflow.exception import MetaflowException, MetaflowInternalError
 from metaflow.package import MetaflowPackage
-from metaflow.plugins import BatchDecorator
+from metaflow.plugins.aws.batch.batch_decorator import BatchDecorator
+from metaflow.tagging_util import validate_tags
 from metaflow.util import get_username, to_bytes, to_unicode
 
 from .step_functions import StepFunctions
@@ -131,11 +135,14 @@ def create(
     log_execution_history=False,
     **kwargs,
 ):
+    validate_tags(tags)
+
     obj.echo(
         "Deploying *%s* to AWS Step Functions..." % obj.state_machine_name, bold=True
     )
 
-    check_metadata_service_version(obj)
+    if SERVICE_VERSION_CHECK:
+        check_metadata_service_version(obj)
 
     token = resolve_token(
         obj.state_machine_name,
@@ -437,13 +444,11 @@ def trigger(obj, run_id_file=None, **kwargs):
     def _convert_value(param):
         # Swap `-` with `_` in parameter name to match click's behavior
         val = kwargs.get(param.name.replace("-", "_").lower())
-        return (
-            json.dumps(val)
-            if param.kwargs.get("type") == JSONType
-            else val()
-            if callable(val)
-            else val
-        )
+        if param.kwargs.get("type") == JSONType:
+            val = json.dumps(val)
+        elif isinstance(val, parameters.DelayedEvaluationParameter):
+            val = val(return_str=True)
+        return val
 
     params = {
         param.name: _convert_value(param)

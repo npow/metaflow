@@ -8,7 +8,7 @@ from metaflow import util
 from metaflow import R, current
 
 from metaflow.decorators import StepDecorator
-from metaflow.plugins import ResourcesDecorator
+from metaflow.plugins.resources_decorator import ResourcesDecorator
 from metaflow.plugins.timeout_decorator import get_run_time_limit_for_task
 from metaflow.metadata import MetaDatum
 from metaflow.metadata.util import sync_local_metadata_to_datastore
@@ -20,7 +20,7 @@ from metaflow.metaflow_config import (
     ECS_FARGATE_EXECUTION_ROLE,
     DATASTORE_LOCAL_DIR,
 )
-from metaflow.sidecar import SidecarSubProcess
+from metaflow.sidecar import Sidecar
 from metaflow.unbounded_foreach import UBF_CONTROL
 
 from .batch import BatchException
@@ -29,60 +29,49 @@ from ..aws_utils import compute_resource_attributes, get_docker_registry
 
 class BatchDecorator(StepDecorator):
     """
-    Step decorator to specify that this step should execute on AWS Batch.
+    Specifies that this step should execute on [AWS Batch](https://aws.amazon.com/batch/).
 
-    This decorator indicates that your step should execute on AWS Batch. Note
-    that you can apply this decorator automatically to all steps using the
-    ```--with batch``` argument when calling run/resume. Step level decorators
-    within the code are overrides and will force a step to execute on AWS Batch
-    regardless of the ```--with``` specification.
-
-    To use, annotate your step as follows:
-    ```
-    @batch
-    @step
-    def my_step(self):
-        ...
-    ```
     Parameters
     ----------
     cpu : int
-        Number of CPUs required for this step. Defaults to 1. If @resources is
-        also present, the maximum value from all decorators is used
+        Number of CPUs required for this step. Defaults to 1. If `@resources` is
+        also present, the maximum value from all decorators is used.
     gpu : int
-        Number of GPUs required for this step. Defaults to 0. If @resources is
-        also present, the maximum value from all decorators is used
+        Number of GPUs required for this step. Defaults to 0. If `@resources` is
+        also present, the maximum value from all decorators is used.
     memory : int
-        Memory size (in MB) required for this step. Defaults to 4096. If
-        @resources is also present, the maximum value from all decorators is
-        used
+        Memory size (in MB) required for this step. Defaults to 4096 (4GB). If
+        `@resources` is also present, the maximum value from all decorators is
+        used.
     image : string
         Docker image to use when launching on AWS Batch. If not specified, a
-        default docker image mapping to the current version of Python is used
+        default Docker image mapping to the current version of Python is used.
     queue : string
         AWS Batch Job Queue to submit the job to. Defaults to the one
-        specified by the environment variable METAFLOW_BATCH_JOB_QUEUE
+        specified by the configuration variable `METAFLOW_BATCH_JOB_QUEUE`.
     iam_role : string
-        AWS IAM role that AWS Batch container uses to access AWS cloud resources
-        (Amazon S3, Amazon DynamoDb, etc). Defaults to the one specified by the
-        environment variable METAFLOW_ECS_S3_ACCESS_IAM_ROLE
+        AWS IAM role that AWS Batch container uses to access AWS cloud resources.
+        Defaults to the one specified by the configuration variable `METAFLOW_ECS_S3_ACCESS_IAM_ROLE`.
     execution_role : string
-        AWS IAM role that AWS Batch can use to trigger AWS Fargate tasks.
-        Defaults to the one determined by the environment variable
-        METAFLOW_ECS_FARGATE_EXECUTION_ROLE https://docs.aws.amazon.com/batch/latest/userguide/execution-IAM-role.html
+        AWS IAM role that AWS Batch can use [to trigger AWS Fargate tasks]
+        (https://docs.aws.amazon.com/batch/latest/userguide/execution-IAM-role.html).
+        Defaults to the one determined by the configuration variable
+        `METAFLOW_ECS_FARGATE_EXECUTION_ROLE`.
     shared_memory : int
         The value for the size (in MiB) of the /dev/shm volume for this step.
-        This parameter maps to the --shm-size option to docker run.
+        This parameter maps to the `--shm-size` option in Docker.
     max_swap : int
         The total amount of swap memory (in MiB) a container can use for this
-        step. This parameter is translated to the --memory-swap option to
-        docker run where the value is the sum of the container memory plus the
-        max_swap value.
+        step. This parameter is translated to the `--memory-swap` option in
+        Docker where the value is the sum of the container memory plus the
+        `max_swap` value.
     swappiness : int
         This allows you to tune memory swappiness behavior for this step.
         A swappiness value of 0 causes swapping not to happen unless absolutely
         necessary. A swappiness value of 100 causes pages to be swapped very
         aggressively. Accepted values are whole numbers between 0 and 100.
+    inferentia : int
+        Number of Inferentia chips required for this step. Defaults to 0.
     """
 
     name = "batch"
@@ -97,6 +86,7 @@ class BatchDecorator(StepDecorator):
         "shared_memory": None,
         "max_swap": None,
         "swappiness": None,
+        "inferentia": None,
         "host_volumes": None,
     }
     resource_defaults = {
@@ -119,7 +109,7 @@ class BatchDecorator(StepDecorator):
             # If metaflow-config doesn't specify a docker image, assign a
             # default docker image.
             else:
-                # Metaflow-R has it's own default docker image (rocker family)
+                # Metaflow-R has its own default docker image (rocker family)
                 if R.use_r():
                     self.attributes["image"] = R.container_image()
                 # Default to vanilla Python image corresponding to major.minor
@@ -220,9 +210,9 @@ class BatchDecorator(StepDecorator):
             meta["aws-batch-jq-name"] = os.environ["AWS_BATCH_JQ_NAME"]
             meta["aws-batch-execution-env"] = os.environ["AWS_EXECUTION_ENV"]
 
-            # Capture AWS Logs metadata. This is best effort only since
+            # Capture AWS Logs metadata. This is best-effort only since
             # only V4 of the metadata uri for the ECS container hosts this
-            # information and it is quite likely that not all consumers of
+            # information, and it is quite likely that not all consumers of
             # Metaflow would be running the container agent compatible with
             # version V4.
             # https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-metadata-endpoint.html
@@ -250,7 +240,8 @@ class BatchDecorator(StepDecorator):
             # Register book-keeping metadata for debugging.
             metadata.register_metadata(run_id, step_name, task_id, entries)
 
-            self._save_logs_sidecar = SidecarSubProcess("save_logs_periodically")
+            self._save_logs_sidecar = Sidecar("save_logs_periodically")
+            self._save_logs_sidecar.start()
 
         num_parallel = int(os.environ.get("AWS_BATCH_JOB_NUM_NODES", 0))
         if num_parallel >= 1 and ubf_context == UBF_CONTROL:
@@ -289,7 +280,7 @@ class BatchDecorator(StepDecorator):
                 )
 
         try:
-            self._save_logs_sidecar.kill()
+            self._save_logs_sidecar.terminate()
         except:
             # Best effort kill
             pass
@@ -299,9 +290,9 @@ class BatchDecorator(StepDecorator):
 
     def _wait_for_mapper_tasks(self, flow, step_name):
         """
-        When lauching multinode task with UBF, need to wait for the secondary
+        When launching multinode task with UBF, need to wait for the secondary
         tasks to finish cleanly and produce their output before exiting the
-        main task. Otherwise main task finishing will cause secondary nodes
+        main task. Otherwise, the main task finishing will cause secondary nodes
         to terminate immediately, and possibly prematurely.
         """
         from metaflow import Step  # avoid circular dependency

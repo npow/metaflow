@@ -11,7 +11,7 @@ from metaflow import R
 from metaflow.exception import CommandException, METAFLOW_EXIT_DISALLOW_RETRY
 from metaflow.metadata.util import sync_local_metadata_from_datastore
 from metaflow.metaflow_config import DATASTORE_LOCAL_DIR
-from metaflow.mflog import TASK_LOG_SOURCE, capture_output_to_mflog
+from metaflow.mflog import TASK_LOG_SOURCE
 
 from .batch import Batch, BatchKilledException
 
@@ -140,6 +140,7 @@ def kill(ctx, run_id, user, my_runs):
 @click.option("--shared-memory", help="Shared Memory requirement for AWS Batch.")
 @click.option("--max-swap", help="Max Swap requirement for AWS Batch.")
 @click.option("--swappiness", help="Swappiness requirement for AWS Batch.")
+@click.option("--inferentia", help="Inferentia requirement for AWS Batch.")
 # TODO: Maybe remove it altogether since it's not used here
 @click.option("--ubf-context", default=None, type=click.Choice([None, "ubf_control"]))
 @click.option("--host-volumes", multiple=True)
@@ -167,6 +168,7 @@ def step(
     shared_memory=None,
     max_swap=None,
     swappiness=None,
+    inferentia=None,
     host_volumes=None,
     num_parallel=None,
     **kwargs
@@ -201,7 +203,7 @@ def step(
     if num_parallel and num_parallel > 1:
         # For multinode, we need to add a placeholder that can be mutated by the caller
         step_args += " [multinode-args]"
-    step_cli = u"{entrypoint} {top_args} step {step} {step_args}".format(
+    step_cli = "{entrypoint} {top_args} step {step} {step_args}".format(
         entrypoint=entrypoint,
         top_args=top_args,
         step=step_name,
@@ -290,6 +292,7 @@ def step(
                 shared_memory=shared_memory,
                 max_swap=max_swap,
                 swappiness=swappiness,
+                inferentia=inferentia,
                 env=env,
                 attrs=attrs,
                 host_volumes=host_volumes,

@@ -63,7 +63,7 @@ class _WrappedModule(object):
         elif name in self._exception_classes:
             return self._exception_classes[name]
         else:
-            # Try to see if this is a sub-module that we can load
+            # Try to see if this is a submodule that we can load
             m = None
             try:
                 m = self._loader.load_module(".".join([self._prefix, name]))
@@ -107,9 +107,17 @@ class _WrappedModule(object):
 
 class ModuleImporter(object):
     # This ModuleImporter implements the Importer Protocol defined in PEP 302
-    def __init__(self, python_path, max_pickle_version, config_dir, module_prefixes):
+    def __init__(
+        self,
+        python_executable,
+        pythonpath,
+        max_pickle_version,
+        config_dir,
+        module_prefixes,
+    ):
         self._module_prefixes = module_prefixes
-        self._python_path = python_path
+        self._python_executable = python_executable
+        self._pythonpath = pythonpath
         self._config_dir = config_dir
         self._client = None
         self._max_pickle_version = max_pickle_version
@@ -142,14 +150,16 @@ class ModuleImporter(object):
             max_pickle_version = min(self._max_pickle_version, pickle.HIGHEST_PROTOCOL)
 
             self._client = Client(
-                self._python_path, max_pickle_version, self._config_dir
+                self._python_executable,
+                self._pythonpath,
+                max_pickle_version,
+                self._config_dir,
             )
             atexit.register(_clean_client, self._client)
 
+            # Get information about overrides and what the server knows about
             exports = self._client.get_exports()
-            sys.path.insert(0, self._config_dir)
-            overrides = importlib.import_module("overrides")
-            sys.path = sys.path[1:]
+            ex_overrides = self._client.get_local_exception_overrides()
 
             prefixes = set()
             export_classes = exports.get("classes", [])
@@ -162,15 +172,6 @@ class ModuleImporter(object):
             ):
                 splits = name.rsplit(".", 1)
                 prefixes.add(splits[0])
-
-            # Look for any exception overrides
-            ex_overrides = {}
-            for override in overrides.__dict__.values():
-                if isinstance(override, LocalException):
-                    cur_ex = ex_overrides.get(override.class_path, None)
-                    if cur_ex is not None:
-                        raise ValueError("Exception %s redefined" % override.class_path)
-                    ex_overrides[override.class_path] = override.wrapped_class
 
             # Now look at the exceptions coming from the server
             formed_exception_classes = {}
@@ -205,8 +206,8 @@ class ModuleImporter(object):
 
             # We will make sure that we create modules even for "empty" prefixes
             # because packages are always loaded hierarchically so if we have
-            # something in a.b.c but nothing directly in a, we still need to
-            # create a module named a. There is probably a better way of doing this
+            # something in `a.b.c` but nothing directly in `a`, we still need to
+            # create a module named `a`. There is probably a better way of doing this
             all_prefixes = list(prefixes)
             for prefix in all_prefixes:
                 parts = prefix.split(".")
@@ -241,8 +242,8 @@ class ModuleImporter(object):
         return name
 
 
-def create_modules(python_path, max_pickle_version, path, prefixes):
-    # This is a extra verification to make sure we are not trying to use the
+def create_modules(python_executable, pythonpath, max_pickle_version, path, prefixes):
+    # This is an extra verification to make sure we are not trying to use the
     # environment escape for something that is in the system
     for prefix in prefixes:
         try:
@@ -262,5 +263,7 @@ def create_modules(python_path, max_pickle_version, path, prefixes):
 
     # sys.meta_path.insert(0, ModuleImporter(python_path, path, prefixes))
     sys.meta_path.append(
-        ModuleImporter(python_path, max_pickle_version, path, prefixes)
+        ModuleImporter(
+            python_executable, pythonpath, max_pickle_version, path, prefixes
+        )
     )

@@ -7,22 +7,21 @@ import shlex
 import time
 
 from metaflow import util
-from metaflow.datatools.s3tail import S3Tail
-from metaflow.exception import MetaflowException, MetaflowInternalError
+from metaflow.plugins.datatools.s3.s3tail import S3Tail
+from metaflow.exception import MetaflowException
 from metaflow.metaflow_config import (
-    BATCH_METADATA_SERVICE_URL,
+    SERVICE_INTERNAL_URL,
     DATATOOLS_S3ROOT,
-    DATASTORE_LOCAL_DIR,
     DATASTORE_SYSROOT_S3,
     DEFAULT_METADATA,
-    BATCH_METADATA_SERVICE_HEADERS,
+    SERVICE_HEADERS,
     BATCH_EMIT_TAGS,
-    DATASTORE_CARD_S3ROOT,
+    CARD_S3ROOT,
+    S3_ENDPOINT_URL,
 )
-from metaflow.mflog.mflog import refine, set_should_persist
 from metaflow.mflog import (
     export_mflog_env_vars,
-    capture_output_to_mflog,
+    bash_capture_logs,
     tail_logs,
     BASH_SAVE_LOGS,
 )
@@ -59,14 +58,10 @@ class Batch(object):
             stderr_path=STDERR_PATH,
             **task_spec
         )
-        init_cmds = environment.get_package_commands(code_package_url)
+        init_cmds = environment.get_package_commands(code_package_url, "s3")
         init_expr = " && ".join(init_cmds)
-        step_expr = " && ".join(
-            [
-                capture_output_to_mflog(a)
-                for a in (environment.bootstrap_commands(step_name))
-            ]
-            + step_cmds
+        step_expr = bash_capture_logs(
+            " && ".join(environment.bootstrap_commands(step_name, "s3") + step_cmds)
         )
 
         # construct an entry point that
@@ -178,6 +173,7 @@ class Batch(object):
         shared_memory=None,
         max_swap=None,
         swappiness=None,
+        inferentia=None,
         env={},
         attrs={},
         host_volumes=None,
@@ -211,6 +207,7 @@ class Batch(object):
                 shared_memory,
                 max_swap,
                 swappiness,
+                inferentia,
                 host_volumes=host_volumes,
                 num_parallel=num_parallel,
             )
@@ -220,6 +217,7 @@ class Batch(object):
             .shared_memory(shared_memory)
             .max_swap(max_swap)
             .swappiness(swappiness)
+            .inferentia(inferentia)
             .timeout_in_secs(run_time_limit)
             .task_id(attrs.get("metaflow.task_id"))
             .environment_variable("AWS_DEFAULT_REGION", self._client.region())
@@ -227,28 +225,34 @@ class Batch(object):
             .environment_variable("METAFLOW_CODE_URL", code_package_url)
             .environment_variable("METAFLOW_CODE_DS", code_package_ds)
             .environment_variable("METAFLOW_USER", attrs["metaflow.user"])
-            .environment_variable("METAFLOW_SERVICE_URL", BATCH_METADATA_SERVICE_URL)
+            .environment_variable("METAFLOW_SERVICE_URL", SERVICE_INTERNAL_URL)
             .environment_variable(
-                "METAFLOW_SERVICE_HEADERS", json.dumps(BATCH_METADATA_SERVICE_HEADERS)
+                "METAFLOW_SERVICE_HEADERS", json.dumps(SERVICE_HEADERS)
             )
             .environment_variable("METAFLOW_DATASTORE_SYSROOT_S3", DATASTORE_SYSROOT_S3)
             .environment_variable("METAFLOW_DATATOOLS_S3ROOT", DATATOOLS_S3ROOT)
             .environment_variable("METAFLOW_DEFAULT_DATASTORE", "s3")
             .environment_variable("METAFLOW_DEFAULT_METADATA", DEFAULT_METADATA)
-            .environment_variable("METAFLOW_CARD_S3ROOT", DATASTORE_CARD_S3ROOT)
+            .environment_variable("METAFLOW_CARD_S3ROOT", CARD_S3ROOT)
             .environment_variable("METAFLOW_RUNTIME_ENVIRONMENT", "aws-batch")
         )
         # Skip setting METAFLOW_DATASTORE_SYSROOT_LOCAL because metadata sync between the local user
         # instance and the remote AWS Batch instance assumes metadata is stored in DATASTORE_LOCAL_DIR
         # on the remote AWS Batch instance; this happens when METAFLOW_DATASTORE_SYSROOT_LOCAL
         # is NOT set (see get_datastore_root_from_config in datastore/local.py).
+        # add METAFLOW_S3_ENDPOINT_URL
+        if S3_ENDPOINT_URL is not None:
+            job.environment_variable("METAFLOW_S3_ENDPOINT_URL", S3_ENDPOINT_URL)
+
         for name, value in env.items():
             job.environment_variable(name, value)
+
         if attrs:
             for key, value in attrs.items():
                 job.parameter(key, value)
         # Tags for AWS Batch job (for say cost attribution)
         if BATCH_EMIT_TAGS:
+            job.tag("app", "metaflow")
             for key in [
                 "metaflow.flow_name",
                 "metaflow.run_id",
@@ -282,6 +286,7 @@ class Batch(object):
         shared_memory=None,
         max_swap=None,
         swappiness=None,
+        inferentia=None,
         host_volumes=None,
         num_parallel=0,
         env={},
@@ -296,7 +301,7 @@ class Batch(object):
                 )
         job = self.create_job(
             step_name,
-            capture_output_to_mflog(step_cli),
+            step_cli,
             task_spec,
             code_package_sha,
             code_package_url,
@@ -312,6 +317,7 @@ class Batch(object):
             shared_memory,
             max_swap,
             swappiness,
+            inferentia,
             env=env,
             attrs=attrs,
             host_volumes=host_volumes,

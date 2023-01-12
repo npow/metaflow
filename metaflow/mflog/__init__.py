@@ -4,6 +4,7 @@ import time
 from .mflog import refine, set_should_persist
 
 from metaflow.util import to_unicode
+from metaflow.exception import MetaflowInternalError
 
 # Log source indicates the system that *minted the timestamp*
 # for the logline. This means that for a single task we can
@@ -24,8 +25,8 @@ RUNTIME_LOG_SOURCE = "runtime"
 TASK_LOG_SOURCE = "task"
 
 # Loglines from all sources need to be merged together to
-# produce a complete view of logs. Hence keep this list short
-# since every items takes a DataStore access.
+# produce a complete view of logs. Hence, keep this list short
+# since each item takes a DataStore access.
 LOG_SOURCES = [RUNTIME_LOG_SOURCE, TASK_LOG_SOURCE]
 
 # BASH_MFLOG defines a bash function that outputs valid mflog
@@ -43,18 +44,20 @@ BASH_MFLOG = (
 BASH_SAVE_LOGS_ARGS = ["python", "-m", "metaflow.mflog.save_logs"]
 BASH_SAVE_LOGS = " ".join(BASH_SAVE_LOGS_ARGS)
 
+
 # this function returns a bash expression that redirects stdout
-# and stderr of the given command to mflog
-def capture_output_to_mflog(command_and_args, var_transform=None):
+# and stderr of the given bash expression to mflog.tee
+def bash_capture_logs(bash_expr, var_transform=None):
     if var_transform is None:
         var_transform = lambda s: "$%s" % s
 
-    return "python -m metaflow.mflog.redirect_streams %s %s %s %s" % (
-        TASK_LOG_SOURCE,
-        var_transform("MFLOG_STDOUT"),
-        var_transform("MFLOG_STDERR"),
-        command_and_args,
+    cmd = "python -m metaflow.mflog.tee %s %s"
+    parts = (
+        bash_expr,
+        cmd % (TASK_LOG_SOURCE, var_transform("MFLOG_STDOUT")),
+        cmd % (TASK_LOG_SOURCE, var_transform("MFLOG_STDERR")),
     )
+    return "(%s) 1>> >(%s) 2>> >(%s >&2)" % parts
 
 
 # update_delay determines how often logs should be uploaded to S3
@@ -76,8 +79,7 @@ def update_delay(secs_since_start):
 
 
 # this function is used to generate a Bash 'export' expression that
-# sets environment variables that are used by 'redirect_streams' and
-# 'save_logs'.
+# sets environment variables that are used by 'tee' and 'save_logs'.
 # Note that we can't set the env vars statically, as some of them
 # may need to be evaluated during runtime
 def export_mflog_env_vars(
@@ -142,3 +144,23 @@ def tail_logs(prefix, stdout_tail, stderr_tail, echo, has_log_updates):
     # tailed.
     _available_logs(stdout_tail, "stdout", echo)
     _available_logs(stderr_tail, "stderr", echo)
+
+
+def get_log_tailer(log_url, datastore_type):
+    if datastore_type == "s3":
+        from metaflow.plugins.datatools.s3.s3tail import S3Tail
+
+        return S3Tail(log_url)
+    elif datastore_type == "azure":
+        from metaflow.plugins.azure.azure_tail import AzureTail
+
+        return AzureTail(log_url)
+    elif datastore_type == "gs":
+        from metaflow.plugins.gcp.gs_tail import GSTail
+
+        return GSTail(log_url)
+    else:
+        raise MetaflowInternalError(
+            "Log tailing implementation missing for datastore type %s"
+            % (datastore_type,)
+        )
