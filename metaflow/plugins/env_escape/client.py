@@ -33,7 +33,7 @@ from .communication.socket_bytestream import SocketByteStream
 
 from .data_transferer import DataTransferer, ObjReference
 from .exception_transferer import load_exception
-from .override_decorators import LocalAttrOverride, LocalException, LocalOverride
+from .override_decorators import LocalAttrOverride, LocalOverride
 from .stub import create_class
 
 BIND_TIMEOUT = 0.1
@@ -41,7 +41,7 @@ BIND_RETRY = 0
 
 
 class Client(object):
-    def __init__(self, python_executable, pythonpath, max_pickle_version, config_dir):
+    def __init__(self, python_path, max_pickle_version, config_dir):
         # Make sure to init these variables (used in __del__) early on in case we
         # have an exception
         self._poller = None
@@ -51,26 +51,24 @@ class Client(object):
         data_transferer.defaultProtocol = max_pickle_version
 
         self._config_dir = config_dir
-        server_path, server_config = os.path.split(config_dir)
         # The client launches the server when created; we use
         # Unix sockets for now
         server_module = ".".join([__package__, "server"])
-        self._socket_path = "/tmp/%s_%d" % (server_config, os.getpid())
+        self._socket_path = "/tmp/%s_%d" % (os.path.basename(config_dir), os.getpid())
         if os.path.exists(self._socket_path):
             raise RuntimeError("Existing socket: %s" % self._socket_path)
         env = os.environ.copy()
-        env["PYTHONPATH"] = pythonpath
+        # env["PYTHONPATH"] = ":".join(sys.path)
         self._server_process = Popen(
             [
-                python_executable,
+                python_path,
                 "-u",
                 "-m",
                 server_module,
                 str(max_pickle_version),
-                server_config,
+                config_dir,
                 self._socket_path,
             ],
-            cwd=server_path,
             env=env,
             stdout=PIPE,
             stderr=PIPE,
@@ -79,33 +77,31 @@ class Client(object):
         )
 
         # Read override configuration
-        # We can't just import the "overrides" module because that does not
-        # distinguish it from other modules named "overrides" (either a third party
-        # lib -- there is one -- or just other escaped modules). We therefore load
-        # a fuller path to distinguish them from one another.
-        pkg_components = []
-        prefix, last_basename = os.path.split(config_dir)
-        while last_basename not in ("metaflow", "metaflow_extensions"):
-            pkg_components.append(last_basename)
-            prefix, last_basename = os.path.split(prefix)
-        pkg_components.append(last_basename)
+        sys.path.insert(0, config_dir)
+        override_module = importlib.import_module("overrides")
+        sys.path = sys.path[1:]
 
-        try:
-            sys.path.insert(0, prefix)
-            override_module = importlib.import_module(
-                ".overrides", package=".".join(reversed(pkg_components))
-            )
-            override_values = override_module.__dict__.values()
-        except ImportError:
-            # We ignore so the file can be non-existent if not needed
-            override_values = []
-        except Exception as e:
-            raise RuntimeError(
-                "Cannot import overrides from '%s': %s" % (sys.path[0], str(e))
-            )
-        finally:
-            sys.path = sys.path[1:]
-
+        # Determine all overrides
+        self._overrides = {}
+        self._getattr_overrides = {}
+        self._setattr_overrides = {}
+        for override in override_module.__dict__.values():
+            if isinstance(override, (LocalOverride, LocalAttrOverride)):
+                for obj_name, obj_funcs in override.obj_mapping.items():
+                    if isinstance(override, LocalOverride):
+                        override_dict = self._overrides.setdefault(obj_name, {})
+                    elif override.is_setattr:
+                        override_dict = self._setattr_overrides.setdefault(obj_name, {})
+                    else:
+                        override_dict = self._getattr_overrides.setdefault(obj_name, {})
+                    if isinstance(obj_funcs, str):
+                        obj_funcs = (obj_funcs,)
+                    for name in obj_funcs:
+                        if name in override_dict:
+                            raise ValueError(
+                                "%s was already overridden for %s" % (name, obj_name)
+                            )
+                        override_dict[name] = override.func
         self._proxied_objects = {}
 
         # Wait for the socket to be up on the other side; we also check if the
@@ -118,7 +114,7 @@ class Client(object):
                     % self._server_process.stderr.read(),
                 )
             time.sleep(1)
-        # Open up the channel and set up the datatransferer pipeline
+        # Open up the channel and setup the datastransfer pipeline
         self._channel = Channel(SocketByteStream.unixconnect(self._socket_path))
         self._datatransferer = DataTransferer(self)
 
@@ -146,38 +142,6 @@ class Client(object):
             )
         }
 
-        # Determine all overrides
-        self._overrides = {}
-        self._getattr_overrides = {}
-        self._setattr_overrides = {}
-        self._exception_overrides = {}
-        for override in override_values:
-            if isinstance(override, (LocalOverride, LocalAttrOverride)):
-                for obj_name, obj_funcs in override.obj_mapping.items():
-                    if obj_name not in self._proxied_classes:
-                        raise ValueError(
-                            "%s does not refer to a proxied or override type" % obj_name
-                        )
-                    if isinstance(override, LocalOverride):
-                        override_dict = self._overrides.setdefault(obj_name, {})
-                    elif override.is_setattr:
-                        override_dict = self._setattr_overrides.setdefault(obj_name, {})
-                    else:
-                        override_dict = self._getattr_overrides.setdefault(obj_name, {})
-                    if isinstance(obj_funcs, str):
-                        obj_funcs = (obj_funcs,)
-                    for name in obj_funcs:
-                        if name in override_dict:
-                            raise ValueError(
-                                "%s was already overridden for %s" % (name, obj_name)
-                            )
-                        override_dict[name] = override.func
-            if isinstance(override, LocalException):
-                cur_ex = self._exception_overrides.get(override.class_path, None)
-                if cur_ex is not None:
-                    raise ValueError("Exception %s redefined" % override.class_path)
-                self._exception_overrides[override.class_path] = override.wrapped_class
-
         # Proxied standalone functions are functions that are proxied
         # as part of other objects like defaultdict for which we create a
         # on-the-fly simple class that is just a callable. This is therefore
@@ -204,7 +168,7 @@ class Client(object):
             self._poller.unregister(self._channel)
             last_evts = self._poller.poll(5)
             for fd, _ in last_evts:
-                # Readlines will never block here because `bufsize` is set to
+                # Readlines will never block here because bufsize is set to
                 # 1 (line buffering)
                 if fd == self._server_process.stdout.fileno():
                     sys.stdout.write(self._server_process.stdout.readline())
@@ -235,9 +199,6 @@ class Client(object):
 
     def get_exports(self):
         return self._export_info
-
-    def get_local_exception_overrides(self):
-        return self._exception_overrides
 
     def stub_request(self, stub, request_type, *args, **kwargs):
         # Encode the operation to send over the wire and wait for the response
@@ -366,17 +327,17 @@ class Client(object):
             for fd, _ in evt_list:
                 if fd == self._channel.fileno():
                     # We deal with this last as this basically gives us the
-                    # response, so we stop looking at things on stdout/stderr
+                    # response so we stop looking at things on stdout/stderr
                     response_ready = True
-                # Readlines will never block here because `bufsize` is set to 1
+                # Readlines will never block here because bufsize is set to 1
                 # (line buffering)
                 elif fd == self._server_process.stdout.fileno():
                     sys.stdout.write(self._server_process.stdout.readline())
                 elif fd == self._server_process.stderr.fileno():
                     sys.stderr.write(self._server_process.stderr.readline())
-        # We make sure there is nothing left to read. On the server side a
-        # flush happens before we respond, so we read until we get an exception;
-        # this is non-blocking
+        # We make sure there is nothing left to read. On the server side, a
+        # flush happens before we respond so we read until we get an exception;
+        # this is non blocking
         while True:
             try:
                 line = self._server_process.stdout.readline()

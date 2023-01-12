@@ -13,7 +13,7 @@ except:
     # python3
     from urllib.parse import urlparse
 
-from metaflow.plugins.datatools.s3 import S3PutObject
+from metaflow.datatools.s3 import S3PutObject
 
 from metaflow.util import to_fileobj, to_bytes, url_quote
 
@@ -36,7 +36,7 @@ BASIC_METADATA = {
     "complex": (
         "text/plain",
         {
-            "utf8-data": "\u523a\u8eab/means sashimi",
+            "utf8-data": u"\u523a\u8eab/means sashimi",
             "with-weird-chars": "Space and !@#<>:/-+=&%",
         },
     ),
@@ -44,7 +44,7 @@ BASIC_METADATA = {
 
 BASIC_RANGE_INFO = {
     "from_beg": (0, 16),  # From beginning
-    "exceed_end": (0, 10 * 1024**3),  # From beginning, should fetch full file
+    "exceed_end": (0, 10 * 1024 ** 3),  # From beginning, should fetch full file
     "middle": (5, 10),  # From middle
     "end": (None, -5),  # Fetch from end
     "till_end": (5, None),  # Fetch till end
@@ -61,7 +61,7 @@ BASIC_DATA = [
     # a basic sanity check
     (
         "3_small_files",
-        {"empty_file": 0, "kb_file": 1024, "mb_file": 1024**2, "missing_file": None},
+        {"empty_file": 0, "kb_file": 1024, "mb_file": 1024 ** 2, "missing_file": None},
     ),
     # S3 paths can be longer than the max allowed filename on Linux
     (
@@ -90,27 +90,27 @@ BASIC_DATA = [
     (
         "crazypath",
         {
-            "crazy spaces": 34,
-            "\x01\xff": 64,
-            "\u523a\u8eab/means sashimi": 33,
-            "crazy-!.$%@2_()\"'": 100,
-            " /cra._:zy/\x01\x02/p a t h/$this/!!is()": 1000,
-            "crazy missing :(": None,
+            u"crazy spaces": 34,
+            u"\x01\xff": 64,
+            u"\u523a\u8eab/means sashimi": 33,
+            u"crazy-!.$%@2_()\"'": 100,
+            u" /cra._:zy/\x01\x02/p a t h/$this/!!is()": 1000,
+            u"crazy missing :(": None,
         },
     ),
 ]
 
 BIG_DATA = [
     # test a file > 4GB
-    ("5gb_file", {"5gb_file": 5 * 1024**3}),
+    ("5gb_file", {"5gb_file": 5 * 1024 ** 3}),
     # ensure that e.g. paged listings work correctly with many keys
     ("3000_files", {str(i): i for i in range(3000)}),
 ]
 
 # Large file to use for benchmark, must be in BASIC_DATA or BIG_DATA
 BENCHMARK_SMALL_FILE = ("3000_files", {"1": 1})
-BENCHMARK_MEDIUM_FILE = ("3_small_files", {"mb_file": 1024**2})
-BENCHMARK_LARGE_FILE = ("5gb_file", {"5gb_file": 5 * 1024**3})
+BENCHMARK_MEDIUM_FILE = ("3_small_files", {"mb_file": 1024 ** 2})
+BENCHMARK_LARGE_FILE = ("5gb_file", {"5gb_file": 5 * 1024 ** 3})
 
 BENCHMARK_SMALL_ITER_MAX = 10001
 BENCHMARK_MEDIUM_ITER_MAX = 501
@@ -125,10 +125,6 @@ PUT_PREFIX = "put_tests"
 
 ExpectedResult = namedtuple(
     "ExpectedResult", "size checksum content_type metadata range"
-)
-
-ExpectedRange = namedtuple(
-    "ExpectedRange", "total_size result_offset result_size req_offset req_size"
 )
 
 
@@ -168,7 +164,7 @@ class RandomFile(object):
 
     def size_from_range(self, start, length):
         if self.size is None:
-            return None, None
+            return None
         if length:
             if length > 0:
                 end = length + start
@@ -181,9 +177,7 @@ class RandomFile(object):
 
         if end > self.size:
             end = self.size
-        if start >= end:
-            return None, None
-        return end - start, start
+        return end - start
 
     def fileobj(self):
         if self.size is not None:
@@ -232,21 +226,12 @@ def _format_test_cases(dataset, meta=None, ranges=None):
             # checksum and create a new dictionary
             for k, (obj, content_type, usermeta) in objs.items():
                 for offset, length in ranges.values():
-                    expected_size, real_offset = obj.size_from_range(offset, length)
-                    if expected_size is None or expected_size > obj.size:
-                        continue
                     files[k][(offset, length)] = ExpectedResult(
-                        size=expected_size,
+                        size=obj.size_from_range(offset, length),
                         checksum=obj.checksum(offset, length),
                         content_type=content_type,
                         metadata=usermeta,
-                        range=ExpectedRange(
-                            total_size=obj.size,
-                            result_offset=real_offset,
-                            result_size=expected_size,
-                            req_offset=offset,
-                            req_size=length,
-                        ),
+                        range=(offset, length),
                     )
 
         ids.append(prefix)
@@ -397,7 +382,7 @@ def pytest_many_prefixes_case():
 def pytest_put_strings_case(meta=None):
     put_prefix = os.path.join(S3ROOT, PUT_PREFIX)
     data = [
-        "unicode: \u523a\u8eab means sashimi",
+        u"unicode: \u523a\u8eab means sashimi",
         b"bytes: \x00\x01\x02",
         "just a string",
     ]

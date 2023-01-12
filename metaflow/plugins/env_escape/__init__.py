@@ -43,37 +43,18 @@ from .client_modules import create_modules
 # environment (like the ones created through the Conda plugin) and we will therefore
 # consider that as the environment we escape to.
 # Note that it is important to store the value back in the environment to make
-# it available to any sub-process that launch as well (ie: when we re-launch WITHIN
-# the conda environment).
+# it available to any sub-process that launch sa well.
 # We also store the maximum protocol version that we support for pickle so that
-# we can determine what to use.
-#
-# In the case of a bootstrap code (for example on Batch), the subprocess mechanism is
-# not used to determine the outside environment but the `generate_trampolines` function
-# in this file is called directly by the remote bootstrap code which operates *outside*
-# of the created conda environment, so it has the same effect
+# we can determine what to use
 ENV_ESCAPE_PY = os.environ.get("METAFLOW_ENV_ESCAPE_PY", sys.executable)
-
-_cur_sys_paths = sys.path
-if len(_cur_sys_paths) > 0 and _cur_sys_paths[0] == "":
-    # This means "current working directory". We actually replace it with the current
-    # working directory because when the env escape server is launched, it is launched
-    # in a different directory and would therefore not have the exact same path
-    # specifications (which is not what we want)
-    _cur_sys_paths[0] = os.getcwd()
-
-ENV_ESCAPE_PATHS = os.environ.get(
-    "METAFLOW_ENV_ESCAPE_PATHS", os.pathsep.join(_cur_sys_paths)
-)
 ENV_ESCAPE_PICKLE_VERSION = os.environ.get(
     "METAFLOW_ENV_ESCAPE_PICKLE_VERSION", str(pickle.HIGHEST_PROTOCOL)
 )
 os.environ["METAFLOW_ENV_ESCAPE_PICKLE_VERSION"] = ENV_ESCAPE_PICKLE_VERSION
-os.environ["METAFLOW_ENV_ESCAPE_PATHS"] = ENV_ESCAPE_PATHS
 os.environ["METAFLOW_ENV_ESCAPE_PY"] = ENV_ESCAPE_PY
 
 
-def generate_trampolines(out_dir):
+def generate_trampolines(python_path):
     # This function will look in the configurations directory and create
     # files named <module>.py that will properly setup the environment escape when
     # called
@@ -82,6 +63,9 @@ def generate_trampolines(out_dir):
     # functionality, in that case, set METAFLOW_ENV_ESCAPE_DISABLED
     if os.environ.get("METAFLOW_ENV_ESCAPE_DISABLED", False) in (True, "True"):
         return
+
+    python_interpreter_path = ENV_ESCAPE_PY
+    max_pickle_version = int(ENV_ESCAPE_PICKLE_VERSION)
 
     paths = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "configurations")]
     for m in get_modules("plugins.env_escape"):
@@ -98,9 +82,7 @@ def generate_trampolines(out_dir):
                     module_names = dir_name[8:].split("__")
                     for module_name in module_names:
                         with open(
-                            os.path.join(out_dir, module_name + ".py"),
-                            mode="w",
-                            encoding="utf-8",
+                            os.path.join(python_path, module_name + ".py"), mode="w"
                         ) as f:
                             f.write(
                                 """
@@ -137,34 +119,29 @@ def load():
             # in which case we are happy (since no module exists) OR we are being imported by the
             # server in which case we could not find the underlying module so we re-raise
             # this error.
-            # We distinguish these cases by checking if the executable is the
-            # python_executable the server should be using
-            if sys.executable == "{python_executable}":
+            # We distinguish these cases by checking if the executable is the python_path the
+            # server should be using
+            if sys.executable == "{python_path}":
                 raise
-            # print("Env escape using executable {python_executable}")
+            # print("Env escape using executable {python_path}")
         else:
             # Inverse logic as above here.
-            if sys.executable != "{python_executable}":
-                # We use the package locally and warn user.
-                print("Not using environment escape for '%s' as module present" % prefix)
-            # In both cases, we don't load our loader since
-            # the package is locally present
-            sys.path = old_paths
-            return
+            if sys.executable == "{python_path}":
+                return
+            raise RuntimeError("Trying to override '%s' when module exists in system" % prefix)
     sys.path = old_paths
-    m = ModuleImporter("{python_executable}", "{pythonpath}", {max_pickle_version}, "{path}", {prefixes})
+    m = ModuleImporter("{python_path}", {max_pickle_version}, "{path}", {prefixes})
     sys.meta_path.insert(0, m)
     # Reload this module using the ModuleImporter
     importlib.import_module("{module_name}")
 
-if not "{python_executable}":
+if not "{python_path}":
     raise RuntimeError(
         "Trying to access an escaped module ({module_name}) without a valid interpreter")
 load()
 """.format(
-                                    python_executable=ENV_ESCAPE_PY,
-                                    pythonpath=ENV_ESCAPE_PATHS,
-                                    max_pickle_version=int(ENV_ESCAPE_PICKLE_VERSION),
+                                    python_path=python_interpreter_path,
+                                    max_pickle_version=max_pickle_version,
                                     path=path,
                                     prefixes=module_names,
                                     module_name=module_name,
@@ -172,7 +149,7 @@ load()
                             )
 
 
-def init(python_executable, pythonpath, max_pickle_version):
+def init(python_interpreter_path, max_pickle_version):
     # This function will look in the configurations directory and setup
     # the proper overrides
     config_dir = os.path.join(
@@ -186,9 +163,5 @@ def init(python_executable, pythonpath, max_pickle_version):
             if dir_name.startswith("emulate_"):
                 module_names = dir_name[8:].split("__")
                 create_modules(
-                    python_executable,
-                    pythonpath,
-                    max_pickle_version,
-                    path,
-                    module_names,
+                    python_interpreter_path, max_pickle_version, path, module_names
                 )

@@ -174,24 +174,19 @@ def get_username():
     return None
 
 
-def resolve_identity_as_tuple():
+def resolve_identity():
     prod_token = os.environ.get("METAFLOW_PRODUCTION_TOKEN")
     if prod_token:
-        return "production", prod_token
+        return "production:%s" % prod_token
     user = get_username()
     if user and user != "root":
-        return "user", user
+        return "user:%s" % user
     else:
         raise MetaflowUnknownUser()
 
 
-def resolve_identity():
-    identity_type, identity_value = resolve_identity_as_tuple()
-    return "%s:%s" % (identity_type, identity_value)
-
-
 def get_latest_run_id(echo, flow_name):
-    from metaflow.plugins.datastores.local_storage import LocalStorage
+    from metaflow.datastore.local_storage import LocalStorage
 
     local_root = LocalStorage.datastore_root
     if local_root is None:
@@ -207,7 +202,7 @@ def get_latest_run_id(echo, flow_name):
 
 
 def write_latest_run_id(obj, run_id):
-    from metaflow.plugins.datastores.local_storage import LocalStorage
+    from metaflow.datastore.local_storage import LocalStorage
 
     if LocalStorage.datastore_root is None:
         LocalStorage.datastore_root = LocalStorage.get_datastore_root_from_config(
@@ -387,25 +382,6 @@ def which(cmd, mode=os.F_OK | os.X_OK, path=None):
         return None
 
 
-def to_camelcase(obj):
-    """
-    Convert all keys of a json to camel case from snake case.
-    """
-    if isinstance(obj, (str, int, float)):
-        return obj
-    if isinstance(obj, dict):
-        res = obj.__class__()
-        for k in obj:
-            res[
-                re.sub(r"(?!^)_([a-zA-Z])", lambda x: x.group(1).upper(), k)
-            ] = to_camelcase(obj[k])
-    elif isinstance(obj, (list, set, tuple)):
-        res = obj.__class__(to_camelcase(v) for v in obj)
-    else:
-        return obj
-    return res
-
-
 def to_pascalcase(obj):
     """
     Convert all keys of a json to pascal case.
@@ -423,18 +399,3 @@ def to_pascalcase(obj):
     else:
         return obj
     return res
-
-
-def tar_safe_extract(tar, path=".", members=None, *, numeric_owner=False):
-    def is_within_directory(abs_directory, target):
-        prefix = os.path.commonprefix([abs_directory, os.path.abspath(target)])
-        return prefix == abs_directory
-
-    abs_directory = os.path.abspath(path)
-    if any(
-        not is_within_directory(abs_directory, os.path.join(path, member.name))
-        for member in tar.getmembers()
-    ):
-        raise Exception("Attempted path traversal in TAR file")
-
-    tar.extractall(path, members, numeric_owner=numeric_owner)

@@ -148,7 +148,6 @@ class BatchJob(object):
         shared_memory,
         max_swap,
         swappiness,
-        inferentia,
         host_volumes,
         num_parallel,
     ):
@@ -248,26 +247,6 @@ class BatchJob(object):
                         "maxSwap"
                     ] = int(max_swap)
 
-        if inferentia:
-            if not (isinstance(inferentia, (int, unicode, basestring))):
-                raise BatchJobException(
-                    "invalid inferentia value: ({}) (should be 0 or greater)".format(
-                        inferentia
-                    )
-                )
-            else:
-                job_definition["containerProperties"]["linuxParameters"]["devices"] = []
-                for i in range(int(inferentia)):
-                    job_definition["containerProperties"]["linuxParameters"][
-                        "devices"
-                    ].append(
-                        {
-                            "containerPath": "/dev/neuron{}".format(i),
-                            "hostPath": "/dev/neuron{}".format(i),
-                            "permissions": ["read", "write"],
-                        }
-                    )
-
         if host_volumes:
             job_definition["containerProperties"]["volumes"] = []
             job_definition["containerProperties"]["mountPoints"] = []
@@ -342,7 +321,6 @@ class BatchJob(object):
         shared_memory,
         max_swap,
         swappiness,
-        inferentia,
         host_volumes,
         num_parallel,
     ):
@@ -354,7 +332,6 @@ class BatchJob(object):
             shared_memory,
             max_swap,
             swappiness,
-            inferentia,
             host_volumes,
             num_parallel,
         )
@@ -396,10 +373,6 @@ class BatchJob(object):
         self._swappiness = swappiness
         return self
 
-    def inferentia(self, inferentia):
-        self._inferentia = inferentia
-        return self
-
     def command(self, command):
         if "command" not in self.payload["containerOverrides"]:
             self.payload["containerOverrides"]["command"] = []
@@ -413,25 +386,20 @@ class BatchJob(object):
             )
         if "resourceRequirements" not in self.payload["containerOverrides"]:
             self.payload["containerOverrides"]["resourceRequirements"] = []
-
-        # %g will format the value without .0 if it doesn't have a fractional part
-        #
-        # While AWS Batch supports fractional values for fargate, it does not
-        # seem to like seeing values like 2.0 for non-fargate environments.
         self.payload["containerOverrides"]["resourceRequirements"].append(
-            {"value": "%g" % (float(cpu)), "type": "VCPU"}
+            {"value": str(cpu), "type": "VCPU"}
         )
         return self
 
     def memory(self, mem):
-        if not (isinstance(mem, (int, unicode, basestring, float)) and float(mem) > 0):
+        if not (isinstance(mem, (int, unicode, basestring)) and int(mem) > 0):
             raise BatchJobException(
                 "Invalid memory value ({}); it should be greater than 0".format(mem)
             )
         if "resourceRequirements" not in self.payload["containerOverrides"]:
             self.payload["containerOverrides"]["resourceRequirements"] = []
         self.payload["containerOverrides"]["resourceRequirements"].append(
-            {"value": str(int(float(mem))), "type": "MEMORY"}
+            {"value": str(mem), "type": "MEMORY"}
         )
         return self
 
@@ -440,20 +408,15 @@ class BatchJob(object):
             raise BatchJobException(
                 "invalid gpu value: ({}) (should be 0 or greater)".format(gpu)
             )
-        if float(gpu) > 0:
+        if int(gpu) > 0:
             if "resourceRequirements" not in self.payload["containerOverrides"]:
                 self.payload["containerOverrides"]["resourceRequirements"] = []
-
-            # Only integer values are supported but the value passed to us
-            # could be a float-converted-to-string
             self.payload["containerOverrides"]["resourceRequirements"].append(
-                {"type": "GPU", "value": str(int(float(gpu)))}
+                {"type": "GPU", "value": str(gpu)}
             )
         return self
 
     def environment_variable(self, name, value):
-        if value is None:
-            return self
         if "environment" not in self.payload["containerOverrides"]:
             self.payload["containerOverrides"]["environment"] = []
         value = str(value)
@@ -550,7 +513,7 @@ class RunningJob(object):
         # batch.submit_job API call is not strongly consistent(¯\_(ツ)_/¯).
         # We add a check here to guard against that. The `update()` call
         # will ensure that we poll `batch.describe_jobs` until we get a
-        # satisfactory response at least once throughout the lifecycle of
+        # satisfactory response at least once through out the lifecycle of
         # the job.
         if len(data["jobs"]) == 1:
             self._apply(data["jobs"][0])

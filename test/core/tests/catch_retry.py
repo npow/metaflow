@@ -8,8 +8,7 @@ class CatchRetryTest(MetaflowTest):
     @tag("retry(times=3,minutes_between_retries=0)")
     @steps(0, ["start"])
     def step_start(self):
-        import os
-        import sys
+        import os, sys
 
         self.test_attempt = current.retry_count
         sys.stdout.write("stdout testing logs %d\n" % self.test_attempt)

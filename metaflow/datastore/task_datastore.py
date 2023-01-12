@@ -16,8 +16,6 @@ from ..util import Path, is_stringish, to_fileobj
 
 from .exceptions import DataException, UnpicklableArtifactException
 
-_included_file_type = "<class 'metaflow.includefile.IncludedFile'>"
-
 
 def only_if_not_done(f):
     @wraps(f)
@@ -152,7 +150,7 @@ class TaskDataStore(object):
                 if self._attempt is None:
                     self._attempt = max_attempt
                 elif max_attempt is None or self._attempt > max_attempt:
-                    # In this case the attempt does not exist, so we can't load
+                    # In this case, the attempt does not exist so we can't load
                     # anything
                     self._objects = {}
                     self._info = {}
@@ -301,7 +299,6 @@ class TaskDataStore(object):
                     "type": str(type(obj)),
                     "encoding": encode_type,
                 }
-
                 artifact_names.append(name)
                 yield blob
 
@@ -389,11 +386,7 @@ class TaskDataStore(object):
         """
         for name in names:
             info = self._info.get(name)
-            if info["type"] == _included_file_type:
-                sz = self[name].size
-            else:
-                sz = info.get("size", 0)
-            yield name, sz
+            yield name, info.get("size", 0)
 
     @require_mode("r")
     def get_legacy_log_size(self, stream):
@@ -576,7 +569,7 @@ class TaskDataStore(object):
             # Conservatively check if the actual object is None,
             # in case the artifact is stored using a different python version.
             # Note that if an object is None and stored in Py2 and accessed in
-            # Py3, this test will fail and we will fall back to the slow path. This
+            # Py3, this test will fail and we will fallback to the slow path. This
             # is intended (being conservative)
             if obj_type == str(type(None)):
                 return True
@@ -688,7 +681,7 @@ class TaskDataStore(object):
             self._info.update(flow._datastore._info)
 
         # we create a list of valid_artifacts in advance, outside of
-        # artifacts_iter, so we can provide a len_hint below
+        # artifacts_iter so we can provide a len_hint below
         valid_artifacts = []
         for var in dir(flow):
             if var.startswith("__") or var in flow._EPHEMERAL:
@@ -790,37 +783,18 @@ class TaskDataStore(object):
                 continue
             if k[0] == "_" and not show_private:
                 continue
-
-            info = self._info[k]
-            if max_value_size is not None:
-                if info["type"] == _included_file_type:
-                    sz = self[k].size
-                else:
-                    sz = info.get("size", 0)
-
-                if sz == 0 or sz > max_value_size:
-                    d[k] = ArtifactTooLarge()
-                else:
-                    d[k] = self[k]
-                    if info["type"] == _included_file_type:
-                        d[k] = d[k].decode(k)
+            if max_value_size is not None and self._info[k]["size"] > max_value_size:
+                d[k] = ArtifactTooLarge()
             else:
                 d[k] = self[k]
-                if info["type"] == _included_file_type:
-                    d[k] = d[k].decode(k)
-
         return d
 
     @require_mode("r")
     def format(self, **kwargs):
         def lines():
             for k, v in self.to_dict(**kwargs).items():
-                if self._info[k]["type"] == _included_file_type:
-                    sz = self[k].size
-                else:
-                    sz = self._info[k]["size"]
                 yield k, "*{key}* [size: {size} type: {type}] = {value}".format(
-                    key=k, value=v, size=sz, type=self._info[k]["type"]
+                    key=k, value=v, **self._info[k]
                 )
 
         return "\n".join(line for k, line in sorted(lines()))

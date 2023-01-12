@@ -23,6 +23,7 @@ if sys.version_info[0] == 3:
     def unicode(x, y):
         return x
 
+
 else:  # python 2
     python3 = False
     unicode_type = unicode
@@ -198,7 +199,7 @@ def render(
     A string containing the rendered template.
     """
 
-    # If the template is a sequence but not derived from a string
+    # If the template is a seqeuence but not derived from a string
     if isinstance(template, Sequence) and not isinstance(template, string_type):
         # Then we don't need to tokenize it
         # But it does need to be a generator
@@ -292,7 +293,7 @@ def render(
                         text += "%s%s %s%s" % (
                             def_ldel,
                             {
-                                "comment": "!",
+                                "commment": "!",
                                 "section": "#",
                                 "inverted section": "^",
                                 "end": "/",
@@ -414,7 +415,7 @@ def render(
                 # then remove the spaces from the end
                 part_out = part_out.rstrip(" \t")
 
-            # Add the partials output to the output
+            # Add the partials output to the ouput
             if python3:
                 output += part_out
             else:  # python 2

@@ -7,6 +7,7 @@ from metaflow.decorators import StepDecorator, flow_decorators
 from metaflow.current import current
 from metaflow.util import to_unicode
 from .component_serializer import CardComponentCollector, get_card_class
+from .card_modules import _get_external_card_package_paths
 
 
 # from metaflow import get_metadata
@@ -22,24 +23,6 @@ def warning_message(message, logger=None, ts=False):
 
 
 class CardDecorator(StepDecorator):
-    """
-    Creates a human-readable report, a Metaflow Card, after this step completes.
-
-    Note that you may add multiple `@card` decorators in a step with different parameters.
-
-    Parameters
-    ----------
-    type : str
-        Card type (default: 'default').
-    id : str
-        If multiple cards are present, use this id to identify this card.
-    options : Dict
-        Options passed to the card. The contents depend on the card type.
-    timeout : int
-        Interrupt reporting if it takes more than this many seconds
-        (default: 45).
-    """
-
     name = "card"
     defaults = {
         "type": "default",
@@ -68,6 +51,49 @@ class CardDecorator(StepDecorator):
         self._card_uuid = None
         self._user_set_card_id = None
 
+    def add_to_package(self):
+        return list(self._load_card_package())
+
+    def _load_card_package(self):
+
+        from . import card_modules
+
+        card_modules_root = os.path.dirname(card_modules.__file__)
+
+        for path_tuple in self._walk(
+            card_modules_root, filter_extensions=[".html", ".js", ".css"]
+        ):
+            file_path, arcname = path_tuple
+            yield (file_path, os.path.join("metaflow", "plugins", "cards", arcname))
+
+        external_card_pth_generator = _get_external_card_package_paths()
+        if external_card_pth_generator is None:
+            return
+        for module_pth, parent_arcname in external_card_pth_generator:
+            # `_get_card_package_paths` is a generator which yields
+            # path to the module and its relative arcname in the metaflow-extensions package.
+            for file_pth, rel_path in self._walk(module_pth, prefix_root=True):
+                arcname = os.path.join(parent_arcname, rel_path)
+                yield (file_pth, arcname)
+
+    def _walk(self, root, filter_extensions=[], prefix_root=False):
+        root = to_unicode(root)  # handle files/folder with non ascii chars
+        prfx = "%s/" % (root if prefix_root else os.path.dirname(root))
+        prefixlen = len(prfx)
+        for path, dirs, files in os.walk(root):
+            for fname in files:
+                # ignoring filesnames which are hidden;
+                # TODO : Should we ignore hidden filenames
+                if fname[0] == ".":
+                    continue
+
+                if len(filter_extensions) > 0 and not any(
+                    fname.endswith(s) for s in filter_extensions
+                ):
+                    continue
+                p = os.path.join(path, fname)
+                yield p, p[prefixlen:]
+
     def _is_event_registered(self, evt_name):
         return evt_name in self._called_once
 
@@ -93,12 +119,25 @@ class CardDecorator(StepDecorator):
         self._logger = logger
         self.card_options = None
 
-        self.card_options = self.attributes["options"]
+        # Populate the defaults which may be missing.
+        missing_keys = set(self.defaults.keys()) - set(self.attributes.keys())
+        for k in missing_keys:
+            self.attributes[k] = self.defaults[k]
+
+        # when instantiation happens from the CLI we sometimes get stringified JSON and sometimes a dict for the
+        # `options` attributes. Hence we need to check for both and serialized.
+        if type(self.attributes["options"]) is str:
+            try:
+                self.card_options = json.loads(self.attributes["options"])
+            except json.decoder.JSONDecodeError:
+                self.card_options = self.defaults["options"]
+        else:
+            self.card_options = self.attributes["options"]
 
         evt_name = "step-init"
         # `'%s-%s'%(evt_name,step_name)` ensures that we capture this once per @card per @step.
         # Since there can be many steps checking if event is registered for `evt_name` will only make it check it once for all steps.
-        # Hence, we have `_is_event_registered('%s-%s'%(evt_name,step_name))`
+        # Hence we have `_is_event_registered('%s-%s'%(evt_name,step_name))`
         evt = "%s-%s" % (evt_name, step_name)
         if not self._is_event_registered(evt):
             # We set the total count of decorators so that we can use it for
@@ -140,7 +179,7 @@ class CardDecorator(StepDecorator):
         ):
             # There should be a warning issued to the user that `id` doesn't match regex pattern
             # Since it is doesn't match pattern, we need to ensure that `id` is not accepted by `current`
-            # and warn users that they cannot use id for their arguments.
+            # and warn users that they cannot use id for thier arguements.
             wrn_msg = (
                 "@card with id '%s' doesn't match REGEX pattern. "
                 "Adding custom components to cards will not be accessible via `current.card['%s']`. "
@@ -168,9 +207,9 @@ class CardDecorator(StepDecorator):
         )
         self._card_uuid = card_metadata["uuid"]
 
-        # This means that we are calling `task_pre_step` on the last card decorator.
+        # This means that the we are calling `task_pre_step` on the last card decorator.
         # We can now `finalize` method in the CardComponentCollector object.
-        # This will set up the `current.card` object for usage inside `@step` code.
+        # This will setup the `current.card` object for usage inside `@step` code.
         if self.step_counter == self.total_decos_on_step[step_name]:
             current.card._finalize()
 
@@ -205,11 +244,8 @@ class CardDecorator(StepDecorator):
             "environment": self._environment.TYPE,
             "datastore": self._flow_datastore.TYPE,
             "datastore-root": self._flow_datastore.datastore_root,
-            "no-pylint": True,
-            "event-logger": "nullSidecarLogger",
-            "monitor": "nullSidecarMonitor",
             # We don't provide --with as all execution is taking place in
-            # the context of the main process
+            # the context of the main processs
         }
         return list(self._options(top_level_options))
 
@@ -243,7 +279,8 @@ class CardDecorator(StepDecorator):
         if self._user_set_card_id is not None:
             cmd += ["--id", str(self._user_set_card_id)]
 
-        if self.attributes["save_errors"]:
+        # Doing this because decospecs parse information as str, since some non-runtime decorators pass it as bool we parse bool to str
+        if str(self.attributes["save_errors"]) == "True":
             cmd += ["--render-error-card"]
 
         if temp_file is not None:

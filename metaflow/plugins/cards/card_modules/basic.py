@@ -42,12 +42,9 @@ def read_file(path):
 
 class DefaultComponent(MetaflowCardComponent):
     """
-    The `DefaultCard` and the `BlankCard` use a JS framework that build the HTML dynamically from JSON.
-    The `DefaultComponent` is the base component that helps build the JSON when `render` is called.
+    The `DefaultCard` and the `BlankCard` use a JS framework that build the HTML dynamically from JSON. The `DefaultComponent` is the base component that helps build the JSON when `render` is called.
 
-    The underlying JS framework consists of various types of objects.
-    These can be found in: "metaflow/plugins/cards/ui/types.ts".
-    The `type` attribute in a `DefaultComponent` corresponds to the type of component in the Javascript framework.
+    The underlying JS framewok consists of various types of objects. These can be found in: "metaflow/plugins/cards/ui/types.ts". The `type` attribute in a `DefaultComponent` corresponds to the type of component in the Javascript framework.
     """
 
     type = None
@@ -341,19 +338,13 @@ class TaskInfoComponent(MetaflowCardComponent):
         )
         # ignore the name as an artifact
         del task_data_dict["data"]["name"]
-
-        _metadata = dict(version=1, template="defaultCardTemplate")
-        # try to parse out metaflow version from tags, but let it go if unset
-        # e.g. if a run came from a local, un-versioned metaflow codebase
-        try:
-            _metadata["metaflow_version"] = [
-                t for t in self._task.parent.parent.tags if "metaflow_version" in t
-            ][0].split("metaflow_version:")[1]
-        except Exception:
-            pass
-
+        mf_version = [
+            t for t in self._task.parent.parent.tags if "metaflow_version" in t
+        ][0].split("metaflow_version:")[1]
         final_component_dict = dict(
-            metadata=_metadata,
+            metadata=dict(
+                metaflow_version=mf_version, version=1, template="defaultCardTemplate"
+            ),
             components=[],
         )
 
@@ -452,12 +443,12 @@ class TaskInfoComponent(MetaflowCardComponent):
             if k not in param_ids
         ]
         if len(artifactlist) > 0:
-            artifact_component = ArtifactsComponent(data=artifactlist).render()
+            artrifact_component = ArtifactsComponent(data=artifactlist).render()
         else:
-            artifact_component = TitleComponent(text="No Artifacts")
+            artrifact_component = TitleComponent(text="No Artifacts")
 
         artifact_section = SectionComponent(
-            title="Artifacts", contents=[artifact_component]
+            title="Artifacts", contents=[artrifact_component]
         ).render()
         dag_component = SectionComponent(
             title="DAG", contents=[DagComponent(data=task_data_dict["graph"]).render()]

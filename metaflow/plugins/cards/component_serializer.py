@@ -35,11 +35,12 @@ class CardComponentCollector:
         - [x] Classes with `ALLOW_USER_COMPONENTS=False` are never default editable.
     - [x] The user can specify an `id` argument to a card, in which case the card is editable through `current.card[id].append`.
         - [x] A card with an id can be also default editable, if there are no other cards that are eligible to be default editable.
-    - [x] If multiple default-editable cards exist but only one card doesn't have an id, the card without an id is considered to be default editable.
-    - [x] If we can't resolve a single default editable card through the above rules, `current.card`.append calls show a warning but the call doesn't fail.
+    - [x] If multiple default-editable cards exist but only one card doesn’t have an id, the card without an id is considered to be default editable.
+    - [x] If we can’t resolve a single default editable card through the above rules, `current.card`.append calls show a warning but the call doesn’t fail.
     - [x] A card that is not default editable can be still edited through:
         - [x] its `current.card['myid']`
-        - [x] by looking it up by its type, e.g. `current.card.get(type='pytorch')`.
+        - [x] by looking it up by its type, e.g. `current.card.get(type=’pytorch’)`.
+
     """
 
     def __init__(self, logger=None):
@@ -83,8 +84,8 @@ class CardComponentCollector:
             - `card_type` (str) : value of the associated `MetaflowCard.type`
             - `card_id` (str) : `id` argument provided at top of decorator
             - `editable` (bool) : this corresponds to the value of `MetaflowCard.ALLOW_USER_COMPONENTS` for that `card_type`
-            - `customize` (bool) : This argument is reserved for a single @card decorator per @step.
-                - An `editable` card with `customize=True` gets precedence to be set as default editable card.
+            - `customize` (bool) : This arguement is reserved for a single @card decorator per @step.
+                - An `editable` card with `customize=True` gets precidence to be set as default editable card.
                 - A default editable card is the card which can be access via the `append` and `extend` methods.
         """
         card_uuid = self.create_uuid()
@@ -146,7 +147,7 @@ class CardComponentCollector:
             if ct is not None:
                 c["exists"] = True
 
-        # If a card has `customize=True` and is not editable then it will not be considered default editable.
+        # If a card has customize=True and is not editable then it will not be considered default editable.
         editable_cards_meta = [c for c in all_card_meta if c["editable"]]
 
         if len(editable_cards_meta) == 0:
@@ -165,7 +166,7 @@ class CardComponentCollector:
             self._default_editable_card = editable_cards_meta[0]["uuid"]
             return
 
-        # Segregate cards which have id as none and those which don't.
+        # Segregate cards which have id as none and those which dont.
         not_none_id_cards = [c for c in editable_cards_meta if c["card_id"] is not None]
         none_id_cards = [c for c in editable_cards_meta if c["card_id"] is None]
 
@@ -174,7 +175,7 @@ class CardComponentCollector:
             self._default_editable_card = none_id_cards[0]["uuid"]
 
         # If the size of the set of ids is not equal to total number of cards with ids then warn the user that we cannot disambiguate
-        # so `current.card['my_card_id']` won't work.
+        # so `current.card['my_card_id']` wont work.
         id_set = set(card_ids)
         if len(card_ids) != len(id_set):
             non_unique_ids = [
@@ -184,7 +185,7 @@ class CardComponentCollector:
                 > 1
             ]
             nui = ", ".join(non_unique_ids)
-            # throw a warning that decorators have non-unique Ids
+            # throw a warning that decorators have non unique Ids
             self._warning(
                 (
                     "Multiple `@card` decorator have been annotated with duplicate ids : %s. "
@@ -212,27 +213,6 @@ class CardComponentCollector:
             self._default_editable_card = customize_cards[0]["uuid"]
 
     def __getitem__(self, key):
-        """
-        Choose a specific card for manipulation.
-
-        When multiple @card decorators are present, you can add an
-        `ID` to distinguish between them, `@card(id=ID)`. This allows you
-        to add components to a specific card like this:
-        ```
-        current.card[ID].append(component)
-        ```
-
-        Parameters
-        ----------
-        key : str
-            Card ID.
-
-        Returns
-        -------
-        CardComponentCollector
-            An object with `append` and `extend` calls which allow you to
-            add components to the chosen card.
-        """
         if key in self._card_id_map:
             card_uuid = self._card_id_map[key]
             return self._cards_components[card_uuid]
@@ -249,23 +229,6 @@ class CardComponentCollector:
         return []
 
     def __setitem__(self, key, value):
-        """
-        Specify components of the chosen card.
-
-        Instead of adding components to a card individually with `current.card[ID].append(component)`,
-        use this method to assign a list of components to a card, replacing the existing components:
-        ```
-        current.card[ID] = [FirstComponent, SecondComponent]
-        ```
-
-        Parameters
-        ----------
-        key: str
-            Card ID.
-
-        value: List[CardComponent]
-            List of card components to assign to this card.
-        """
         if key in self._card_id_map:
             card_uuid = self._card_id_map[key]
             if not isinstance(value, list):
@@ -284,14 +247,6 @@ class CardComponentCollector:
         )
 
     def append(self, component):
-        """
-        Appends a component to the current card.
-
-        Parameters
-        ----------
-        component : CardComponent
-            Card component to add to this card.
-        """
         if self._default_editable_card is None:
             if (
                 len(self._cards_components) == 1
@@ -327,14 +282,6 @@ class CardComponentCollector:
         self._cards_components[self._default_editable_card].append(component)
 
     def extend(self, components):
-        """
-        Appends many components to the current card.
-
-        Parameters
-        ----------
-        component : Iterator[CardComponent]
-            Card components to add to this card.
-        """
         if self._default_editable_card is None:
             # if there is one card which is not the _default_editable_card then the card is not editable
             if len(self._cards_components) == 1:

@@ -4,21 +4,33 @@ from metaflow.metaflow_environment import InvalidEnvironmentException
 
 class CondaFlowDecorator(FlowDecorator):
     """
-    Specifies the Conda environment for all steps of the flow.
+    Conda decorator that sets a default Conda step decorator for all
+    steps in the flow.
 
-    Use `@conda_base` to set common libraries required by all
-    steps and use `@conda` to specify step-specific additions.
+    To use, add this decorator directly on top of your Flow class:
+    ```
+    @conda_base
+    class MyFlow(FlowSpec):
+        ...
+    ```
+
+    Any step level Conda decorator will override any setting by this decorator.
 
     Parameters
     ----------
     libraries : Dict
-        Libraries to use for this flow. The key is the name of the package
-        and the value is the version to use (default: `{}`).
+        Libraries to use for this flow. The key is the name of the package and the value
+        is the version to use. Defaults to {}
     python : string
-        Version of Python to use, e.g. '3.7.4'
-        (default: None, i.e. the current Python version).
+        Version of Python to use (for example: '3.7.4'). Defaults to None
+        (specified at the step level)
     disabled : bool
-        If set to True, disables Conda (default: False).
+        If set to True, disables Conda (note that this is overridden if a step level decorator
+        sets to True). Defaults to None (specified at the step level)
+    Raises
+    ------
+    InvalidEnvironmentException
+        Raised if --environment=conda is not specified
     """
 
     name = "conda_base"

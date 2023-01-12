@@ -21,7 +21,7 @@ class CondaEnvironment(MetaflowEnvironment):
         self.flow = flow
         self.local_root = None
         # A conda environment sits on top of whatever default environment
-        # the user has, so we get that environment to be able to forward
+        # the user has so we get that environment to be able to forward
         # any calls we don't handle specifically to that one.
         from ...plugins import ENVIRONMENTS
         from metaflow.metaflow_config import DEFAULT_ENVIRONMENT
@@ -42,8 +42,8 @@ class CondaEnvironment(MetaflowEnvironment):
         echo("Bootstrapping conda environment..." + "(this could take a few minutes)")
         self.base_env.init_environment(echo)
 
-    def validate_environment(self, echo, datastore_type):
-        return self.base_env.validate_environment(echo, datastore_type)
+    def validate_environment(self, echo):
+        return self.base_env.validate_environment(echo)
 
     def decospecs(self):
         # Apply conda decorator and base environment's decorators to all steps
@@ -70,14 +70,14 @@ class CondaEnvironment(MetaflowEnvironment):
     def set_local_root(self, ds_root):
         self.local_root = ds_root
 
-    def bootstrap_commands(self, step_name, datastore_type):
+    def bootstrap_commands(self, step_name):
         # Bootstrap conda and execution environment for step
         env_id = self._get_env_id(step_name)
         if env_id is not None:
             return [
                 "echo 'Bootstrapping environment...'",
-                'python -m metaflow.plugins.conda.batch_bootstrap "%s" %s "%s"'
-                % (self.flow.name, env_id, datastore_type),
+                'python -m metaflow.plugins.conda.batch_bootstrap "%s" %s'
+                % (self.flow.name, env_id),
                 "echo 'Environment bootstrapped.'",
             ]
         return []
@@ -129,8 +129,8 @@ class CondaEnvironment(MetaflowEnvironment):
         }
         return new_info
 
-    def get_package_commands(self, code_package_url, datastore_type):
-        return self.base_env.get_package_commands(code_package_url, datastore_type)
+    def get_package_commands(self, code_package_url):
+        return self.base_env.get_package_commands(code_package_url)
 
     def get_environment_info(self):
         return self.base_env.get_environment_info()

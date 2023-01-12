@@ -1,19 +1,23 @@
+import functools
 import json
+from multiprocessing import Pool
 import os
+import tarfile
 import shutil
+import subprocess
 import sys
 
-from metaflow.exception import MetaflowException
+from metaflow.datatools import S3
 from metaflow.metaflow_config import DATASTORE_LOCAL_DIR
 
 from ..env_escape import generate_trampolines, ENV_ESCAPE_PY
 
-from . import CONDA_MAGIC_FILE, get_conda_package_root
+from . import CONDA_MAGIC_FILE
 
 
-def bootstrap_environment(flow_name, env_id, datastore_type):
+def bootstrap_environment(flow_name, env_id):
     setup_conda_manifest(flow_name)
-    packages = download_conda_packages(flow_name, env_id, datastore_type)
+    packages = download_conda_packages(flow_name, env_id)
     install_conda_environment(env_id, packages)
 
 
@@ -27,55 +31,18 @@ def setup_conda_manifest(flow_name):
     )
 
 
-def download_conda_packages(flow_name, env_id, datastore_type):
+def download_conda_packages(flow_name, env_id):
     pkgs_folder = os.path.join(os.getcwd(), "pkgs")
     if not os.path.exists(pkgs_folder):
         os.makedirs(pkgs_folder)
-    # NOTE: if two runs use the same DATASTORE_LOCAL_DIR but different cloud based
-    # datastore roots (e.g. a different DATASTORE_SYSROOT_AZURE), then this breaks.
-    # This shared local manifest CONDA_MAGIC_FILE will say that cache_urls exist,
-    # but those URLs will not actually point to any real objects in the datastore
-    # for the second run.
     manifest_folder = os.path.join(os.getcwd(), DATASTORE_LOCAL_DIR, flow_name)
     with open(os.path.join(manifest_folder, CONDA_MAGIC_FILE)) as f:
         env = json.load(f)[env_id]
-
-        # git commit fbd6c9d8a819fad647958c9fa869153ab37bc0ca introduced support for
-        # Microsoft Azure and made a minor tweak to how conda packages are uploaded. As
-        # a result, the URL stored by Metaflow no longer includes the datastore root (
-        # which arguably helps with portability of datastore). To ensure backwards
-        # compatibility, we add this small check here that checks for the prefix of
-        # the URLs before downloading them appropriately. Of course, a change can be
-        # made to allow the datastore to consume full URLs as well instead of this
-        # change, but given that change's far-reaching consequences, we introduce this
-        # workaround.
-        # https://github.com/Netflix/metaflow/commit/fbd6c9d8a819fad647958c9fa869153ab37bc0ca#diff-1ecbb40de8aba5b41e149987de4aa797a47f4498e5e4e3f63a53d4283dcdf941R198
-        if env["cache_urls"][0].startswith("s3://"):
-            from metaflow.plugins.datatools import S3
-
-            with S3() as s3:
-                for pkg in s3.get_many(env["cache_urls"]):
-                    shutil.move(
-                        pkg.path, os.path.join(pkgs_folder, os.path.basename(pkg.key))
-                    )
-        else:
-            # Import DATASTORES dynamically... otherwise, circular import
-            from metaflow.plugins import DATASTORES
-
-            storage_impl = [d for d in DATASTORES if d.TYPE == datastore_type]
-            if len(storage_impl) == 0:
-                raise MetaflowException(
-                    msg="Downloading conda packages from %s datastore is not yet implemented!"
-                    % datastore_type
+        with S3() as s3:
+            for pkg in s3.get_many(env["cache_urls"]):
+                shutil.move(
+                    pkg.path, os.path.join(pkgs_folder, os.path.basename(pkg.key))
                 )
-            conda_package_root = get_conda_package_root(datastore_type)
-            storage = storage_impl[0](conda_package_root)
-            with storage.load_bytes(env["cache_urls"]) as load_result:
-                for key, tmpfile, _ in load_result:
-                    shutil.move(
-                        tmpfile, os.path.join(pkgs_folder, os.path.basename(key))
-                    )
-
         return env["order"]
 
 
@@ -101,4 +68,4 @@ def install_conda_environment(env_id, packages):
 
 
 if __name__ == "__main__":
-    bootstrap_environment(sys.argv[1], sys.argv[2], sys.argv[3])
+    bootstrap_environment(sys.argv[1], sys.argv[2])

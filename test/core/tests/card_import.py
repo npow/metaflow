@@ -64,7 +64,7 @@ class CardImportTest(MetaflowTest):
                         step.name,
                         task_id,
                         impc_ne["type"],
-                        "%s" % cards_info["pathspec"],
+                        "%s\n" % cards_info["pathspec"],
                         card_hash=impc_ne["hash"],
                         exact_match=True,
                     )
@@ -72,7 +72,7 @@ class CardImportTest(MetaflowTest):
                         step.name,
                         task_id,
                         impc_e["type"],
-                        "%d" % random_number,
+                        "%d\n" % random_number,
                         card_hash=impc_e["hash"],
                         exact_match=True,
                     )

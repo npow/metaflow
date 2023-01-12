@@ -17,8 +17,7 @@ NUM_LINES = 5000
     def split(self):
         self.arr = range(NUM_FOREACH)
 
-        import random
-        import string
+        import random, string
 
         self.random_log_prefix = "".join(
             [random.choice(string.ascii_lowercase) for _ in range(5)]
@@ -87,7 +86,7 @@ NUM_LINES = 5000
 
                 for i, (_, _, stream_type, idx, tstamp) in enumerate(task_lines):
                     # test that loglines originate from the correct stream
-                    # and are properly ordered
+                    # and they are properly ordered
                     assert_equals(stream_type, stream)
                     assert_equals(int(idx), i)
 

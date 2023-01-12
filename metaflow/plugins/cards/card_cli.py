@@ -154,7 +154,7 @@ def timeout(time):
     except TimeoutError:
         pass
     finally:
-        # Unregister the signal so that it won't be triggered
+        # Unregister the signal so it won't be triggered
         # if the timeout is not reached.
         signal.signal(signal.SIGALRM, signal.SIG_IGN)
 
@@ -171,7 +171,6 @@ def list_available_cards(
     command="view",
     show_list_as_json=False,
     list_many=False,
-    file=None,
 ):
     # pathspec is full pathspec.
     # todo : create nice response messages on the CLI for cards which were found.
@@ -183,15 +182,7 @@ def list_available_cards(
             for tup in path_tuples
         ]
         if not list_many:
-            # This means that `list_available_cards` is being called once.
-            # So we can directly dump the file
-            dump_dict = dict(pathspec=pathspec, cards=json_arr)
-            if file:
-                with open(file, "w") as f:
-                    json.dump(dump_dict, f)
-            else:
-                ctx.obj.echo_always(json.dumps(dump_dict, indent=4), err=False)
-        # if you have to list many in json format then return
+            print(json.dumps(dict(pathspec=pathspec, cards=json_arr), indent=4))
         return dict(pathspec=pathspec, cards=json_arr)
 
     if list_many:
@@ -262,7 +253,6 @@ def list_many_cards(
     card_id=None,
     follow_resumed=None,
     as_json=None,
-    file=None,
 ):
     from metaflow import Flow
 
@@ -298,7 +288,6 @@ def list_many_cards(
                     command=None,
                     show_list_as_json=as_json,
                     list_many=True,
-                    file=file,
                 )
                 if as_json:
                     js_list.append(js_resp)
@@ -310,11 +299,7 @@ def list_many_cards(
             run.pathspec, card_hash=hash, card_type=type, card_id=card_id
         )
     if as_json:
-        if file:
-            with open(file, "w") as f:
-                json.dump(js_list, f)
-        else:
-            ctx.obj.echo_always(json.dumps(js_list, indent=4), err=False)
+        print(json.dumps(js_list, indent=4))
 
 
 @click.group()
@@ -396,7 +381,7 @@ def render_card(mf_card, task, timeout_value=None):
 )
 @click.option(
     "--options",
-    default=None,
+    default={},
     show_default=True,
     type=JSONType,
     help="arguments of the card being created.",
@@ -480,17 +465,14 @@ def create(
             % (filtered_card.type, timeout),
             fg="green",
         )
-        # If the card is Instantiatable then
+        # If the card is Instatiatable then
         # first instantiate; If instantiation has a TypeError
         # then check for render_error_card and accordingly
         # store the exception as a string or raise the exception
         try:
-            if options is not None:
-                mf_card = filtered_card(
-                    options=options, components=component_arr, graph=graph_dict
-                )
-            else:
-                mf_card = filtered_card(components=component_arr, graph=graph_dict)
+            mf_card = filtered_card(
+                options=options, components=component_arr, graph=graph_dict
+            )
         except TypeError as e:
             if render_error_card:
                 mf_card = None
@@ -639,11 +621,6 @@ def get(
     is_flag=True,
     help="Print all available cards as a JSON object",
 )
-@click.option(
-    "--file",
-    default=None,
-    help="Save the available card list to file.",
-)
 @click.pass_context
 def list(
     ctx,
@@ -653,9 +630,7 @@ def list(
     id=None,
     follow_resumed=False,
     as_json=False,
-    file=None,
 ):
-
     card_id = id
     if pathspec is None:
         list_many_cards(
@@ -665,7 +640,6 @@ def list(
             card_id=card_id,
             follow_resumed=follow_resumed,
             as_json=as_json,
-            file=file,
         )
         return
 
@@ -685,5 +659,4 @@ def list(
         card_datastore,
         command=None,
         show_list_as_json=as_json,
-        file=file,
     )

@@ -124,9 +124,7 @@ class Conda(object):
         if explicit:
             cmd.append("--no-deps")
         cmd.extend(deps)
-        self._call_conda(
-            cmd, architecture=architecture, disable_safety_checks=disable_safety_checks
-        )
+        self._call_conda(cmd, architecture=architecture, disable_safety_checks=False)
 
     def _remove(self, env_id):
         self._call_conda(["env", "remove", "--name", env_id, "--yes", "--quiet"])
@@ -178,6 +176,7 @@ class Conda(object):
             env = {
                 "CONDA_JSON": "True",
                 "CONDA_SUBDIR": (architecture if architecture else ""),
+                "CONDA_USE_ONLY_TAR_BZ2": "True",
                 "MAMBA_NO_BANNER": "1",
                 "MAMBA_JSON": "True",
             }
